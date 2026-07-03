@@ -1,8 +1,11 @@
 """Turbopuffer utilities for archival memory storage."""
-# 这个模块把 Letta 中多类可检索数据统一接入 Turbopuffer：归档记忆 passages、对话 messages、文件 passages 和 tools。
-# 主流程通常是：先把文本抽取/切块并生成 embedding，再按组织、archive、agent 或 source 维度写入不同 namespace；查询时再按 vector / FTS / hybrid / timestamp 模式取回，并把 Turbopuffer 行结果还原成业务层对象。
-# 因为 Turbopuffer 写入会做较重的向量序列化，代码额外封装了重试、并发限流和线程池写入，避免一次外部服务抖动或 CPU 编码阻塞拖垮主事件循环。
 
+# 代码整体说明：本文件是 Letta 与 Turbopuffer 向量数据库之间的适配层。
+# 它不负责切分原始文档，也不直接管理数据库事务；它负责把上层已经准备好的文本、ID、标签和时间戳转换成 Turbopuffer 的列式写入格式。
+# 写入主链路通常是：过滤空文本 → 生成或复用 embedding → 构造 namespace → 组装 upsert_columns → 通过线程池写入 Turbopuffer。
+# 查询主链路通常是：根据 search_mode 准备 query_embedding/query_text → 构造过滤条件 → 调用统一 _execute_query → 将 row 转回 Passage/message/tool 结构。
+# 删除主链路则根据数据类型选择按 ID 删除、按 filter 删除或清空 namespace。
+# 注释重点放在数据如何保持对齐、为什么要分 namespace、为什么要转 UTC、为什么 hybrid 要用 RRF 融合。
 
 import asyncio
 import json
@@ -31,6 +34,8 @@ logger = logging.getLogger(__name__)
 # Type variable for generic async retry decorator
 T = TypeVar("T")
 
+# 这一组常量只影响 Turbopuffer 层的 transient retry，不影响 embedding 请求本身。
+# 参数较小是为了在短暂网络抖动时快速恢复，同时避免长时间阻塞 agent 后续流程。
 # Default retry configuration for turbopuffer operations
 TPUF_MAX_RETRIES = 3
 TPUF_INITIAL_DELAY = 1.0  # seconds
@@ -38,8 +43,11 @@ TPUF_EXPONENTIAL_BASE = 2.0
 TPUF_JITTER = True
 
 
-# 这一层先把“是否值得重试”从具体业务操作中抽出来。后面的写入、删除、查询都可以复用同一套判断，避免每个 Turbopuffer 方法都重复处理网络抖动。
-# 判断重点放在连接、超时、DNS、TLS 握手等短暂性故障；如果是参数错误、权限错误或数据格式错误，则不重试，直接暴露给调用方。
+# ————————————————————————————————————————
+# 这是整个重试机制的“判定器”：它只负责判断异常是否像网络抖动、超时、DNS 等短暂故障。
+# 调用方不会在这里执行重试，而是把这个布尔结果交给 async_retry_with_backoff 决定是否继续尝试。
+# 因此这里要非常保守：明确不可恢复的业务错误不能被误判为 transient，否则会掩盖真正的问题。
+# ————————————————————————————————————————
 def is_transient_error(error: Exception) -> bool:
     """Check if an error is transient and should be retried.
 
@@ -50,6 +58,7 @@ def is_transient_error(error: Exception) -> bool:
         True if the error is transient and can be retried
     """
     # httpx connection errors (network issues, DNS failures, etc.)
+    # 第一层先判断 httpx 明确建模的连接类异常，这类通常是网络瞬时不可达，适合重试。
     if isinstance(error, httpx.ConnectError):
         return True
 
@@ -62,6 +71,7 @@ def is_transient_error(error: Exception) -> bool:
         return True
 
     # Check for connection-related errors in the error message
+    # 第二层是字符串兜底：有些底层网络库异常没有具体类型，只能从错误文本识别连接/解析/SSL 等关键词。
     error_str = str(error).lower()
     transient_patterns = [
         "connect call failed",
@@ -82,8 +92,11 @@ def is_transient_error(error: Exception) -> bool:
     return False
 
 
-# 这是所有 Turbopuffer 异步操作的保护壳：业务函数只关心一次操作怎么做，装饰器负责失败后的指数退避、日志和 tracing 事件。
-# 它和 is_transient_error 配合使用：只有被认定为临时错误的异常才进入重试循环，避免把不可恢复错误“拖延成超时”。
+# ————————————————————————————————————————
+# 这是一个用于异步函数的通用重试装饰器，后面所有 TPUF 写入/删除类方法基本都会复用它。
+# 它把“哪些错误可重试”和“怎么退避等待”解耦：前者由 is_transient_error 判断，后者由 delay/exponential_base/jitter 控制。
+# 这样每个业务方法可以专注准备数据和调用 Turbopuffer，而不用重复写重试循环。
+# ————————————————————————————————————————
 def async_retry_with_backoff(
     max_retries: int = TPUF_MAX_RETRIES,
     initial_delay: float = TPUF_INITIAL_DELAY,
@@ -102,18 +115,27 @@ def async_retry_with_backoff(
         Decorated async function with retry logic
     """
 
+    # ————————————————————————————————————————
+    # 外层 decorator 捕获原始业务函数，并返回真正包裹它的 wrapper。
+    # 这一层存在的意义是保留 max_retries / initial_delay 等配置，让同一个装饰器可以用不同参数复用。
+    # ————————————————————————————————————————
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         @wraps(func)
+        # ————————————————————————————————————————
+        # wrapper 是实际执行重试的地方：它围绕原函数构造 while True，直到成功返回、遇到不可重试错误，或超过最大重试次数。
+        # 注意它只捕获 Exception，不改变业务函数的返回值类型；成功时直接返回原函数结果。
+        # ————————————————————————————————————————
         async def wrapper(*args, **kwargs) -> Any:
             num_retries = 0
             delay = initial_delay
 
+            # 使用无限循环是为了把“成功返回”和“失败退出”都集中到循环内部控制，而不是提前计算固定次数。
             while True:
                 try:
                     return await func(*args, **kwargs)
                 except Exception as e:
-                    # 重试循环的关键分叉在这里：只有临时网络类错误会继续，否则马上把异常交还业务层。
                     # Check if this is a retryable error
+                    # 不可重试错误必须立刻抛出，避免把参数错误、权限错误、schema 错误等业务问题伪装成网络问题。
                     if not is_transient_error(e):
                         # Not a transient error, re-raise immediately
                         raise
@@ -137,6 +159,7 @@ def async_retry_with_backoff(
                     )
 
                     # Check if max retries exceeded
+                    # 这里用 > 而不是 >=，意味着会先记录第 max_retries+1 次失败再确认彻底放弃。
                     if num_retries > max_retries:
                         log_event(
                             "turbopuffer_max_retries_exceeded",
@@ -150,11 +173,11 @@ def async_retry_with_backoff(
                         logger.error(f"Turbopuffer operation '{func.__name__}' failed after {max_retries} retries: {e}")
                         raise
 
-                    # 延迟放在记录日志之后，这样观测系统能看到每次失败和下一次重试间隔。
                     # Wait with exponential backoff
                     await asyncio.sleep(delay)
 
                     # Calculate next delay with optional jitter
+                    # 每次失败后扩大等待间隔，减少在服务短暂不可用时对 TPUF 的持续冲击。
                     delay *= exponential_base
                     if jitter:
                         delay *= 1 + random.random() * 0.1  # Add up to 10% jitter
@@ -164,13 +187,17 @@ def async_retry_with_backoff(
     return decorator
 
 
+# 写入/删除都是外部服务调用，并且可能包含大量向量序列化；这里用全局信号量做粗粒度背压。
 # Global semaphore for Turbopuffer operations to prevent overwhelming the service
 # This is separate from embedding semaphore since Turbopuffer can handle more concurrency
 _GLOBAL_TURBOPUFFER_SEMAPHORE = asyncio.Semaphore(5)
 
 
-# 写入 Turbopuffer 时，向量会被同步地做 base64 等编码，这类 CPU 工作如果直接放在 async 函数里会阻塞事件循环。
-# 因此这里专门在工作线程中创建独立 event loop，把 upsert、按 ID 删除、按 filter 删除都统一塞进 namespace.write；上层只需要 asyncio.to_thread 调用它。
+# ————————————————————————————————————————
+# 这个函数是写入路径的性能保护层：Turbopuffer 的 async write 内部会同步做向量 base64 编码，可能阻塞主事件循环。
+# 所以业务方法不会直接 await namespace.write，而是通过 asyncio.to_thread 调用这个同步包装函数。
+# 这里在线程里创建独立 event loop，再用 AsyncTurbopuffer 完成 upsert/delete/delete_by_filter，避免拖慢 agent 主流程。
+# ————————————————————————————————————————
 def _run_turbopuffer_write_in_thread(
     api_key: str,
     region: str,
@@ -191,16 +218,21 @@ def _run_turbopuffer_write_in_thread(
     from turbopuffer import AsyncTurbopuffer
 
     # Create new event loop for this worker thread
+    # 因为这个函数运行在线程池线程中，不能直接依赖主线程 event loop，所以这里显式创建一个新的 loop。
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
 
+        # ————————————————————————————————————————
+        # 线程中的内部协程负责把传进来的列式数据、删除列表、过滤删除条件、schema 等统一转成 namespace.write 参数。
+        # 通过只添加非空 kwargs，insert/delete/delete_by_filter 可以共用同一个底层写入口。
+        # ————————————————————————————————————————
         async def do_write():
             async with AsyncTurbopuffer(api_key=api_key, region=region) as client:
                 namespace = client.namespace(namespace_name)
 
-                # 这里把三类写操作统一为一个 kwargs：upsert、新增/覆盖；deletes，按 ID 删除；delete_by_filter，按条件批量删除。
                 # Build write kwargs
+                # 统一从 distance_metric 开始构造写入参数；后续根据调用场景再选择 upsert、按 ID 删除或按 filter 删除。
                 kwargs = {"distance_metric": distance_metric}
                 if upsert_columns:
                     kwargs["upsert_columns"] = upsert_columns
@@ -218,29 +250,41 @@ def _run_turbopuffer_write_in_thread(
         loop.close()
 
 
-# 这是总开关：Turbopuffer 不只是依赖 tpuf 配置，还依赖 OpenAI embedding key，因为默认 embedding 模型走 OpenAI。
+# ————————————————————————————————————————
+# 这是全局开关：只有 settings.use_tpuf、Turbopuffer API key、以及 OpenAI embedding key 都存在时，才启用 TPUF。
+# 因为默认 embedding 模型是 OpenAI 的 text-embedding-3-small，所以仅有 TPUF key 不够。
+# ————————————————————————————————————————
 def should_use_tpuf() -> bool:
     # We need OpenAI since we default to their embedding model
+    # 三个条件缺一不可：产品开关、TPUF 凭证、embedding 凭证。这样可以避免配置不完整时半启用。
     return bool(settings.use_tpuf) and bool(settings.tpuf_api_key) and bool(model_settings.openai_api_key)
 
 
-# message 搜索是可选能力。只有总开关打开且配置允许“全量消息 embedding”时，MessageManager 才会把消息同步进 Turbopuffer。
+# ————————————————————————————————————————
+# 消息搜索是可选能力：在全局 TPUF 可用的基础上，还要打开 embed_all_messages 才会把消息写入/查询向量库。
+# ————————————————————————————————————————
 def should_use_tpuf_for_messages() -> bool:
     """Check if Turbopuffer should be used for messages."""
     return should_use_tpuf() and bool(settings.embed_all_messages)
 
 
-# tool 搜索同样走独立开关，避免把工具 schema 的 embedding 成本强行绑定到普通 archival memory 使用场景上。
+# ————————————————————————————————————————
+# 工具搜索同样是单独开关：embed_tools 控制是否为工具定义建立检索索引。
+# ————————————————————————————————————————
 def should_use_tpuf_for_tools() -> bool:
     """Check if Turbopuffer should be used for tools."""
     return should_use_tpuf() and bool(settings.embed_tools)
 
 
-# TurbopufferClient 是本文件的核心门面：外部服务层不直接拼 namespace、schema 或 Turbopuffer 查询参数，而是通过这个类完成写入、查询、删除和结果还原。
-# 类内部按数据类型分组：archive passages、messages、file passages、tools。每组都遵循相似模式：生成 embedding → 组织列式 upsert → 查询时构建过滤器 → 处理结果。
+# ————————————————————————————————————————
+# 这个类集中封装 Letta 与 Turbopuffer 的交互，覆盖三类主要数据：archival passages、messages、tools；后面还扩展到 file passages。
+# 整体调用链可以概括为：提取文本 → 生成 embedding → 组装列式 upsert → 写入 TPUF namespace；查询时则反向执行：构造 filter/query → 执行 query → 转成 Letta 内部对象或 dict。
+# 类内大量方法共享 namespace 命名、embedding、RRF 融合和删除逻辑，因此这些 helper 是理解后续业务方法的基础。
+# ————————————————————————————————————————
 class TurbopufferClient:
     """Client for managing archival memory with Turbopuffer vector database."""
 
+    # 默认 embedding 配置是全类共享的：写入 messages/tools/passages/file passages 时都使用同一维度，保证 namespace 内向量维度一致。
     default_embedding_config = EmbeddingConfig(
         embedding_model="text-embedding-3-small",
         embedding_endpoint_type="openai",
@@ -249,7 +293,10 @@ class TurbopufferClient:
         embedding_chunk_size=DEFAULT_EMBEDDING_CHUNK_SIZE,
     )
 
-    # 初始化阶段只保存 Turbopuffer 凭据和少量 manager。namespace 的具体名字不会在这里固定，而是在每次操作时按 archive / organization / environment 动态解析。
+    # ————————————————————————————————————————
+    # 初始化只保存 TPUF 连接配置，并创建 archive_manager / agent_manager，用于解析 archive namespace 或相关元数据。
+    # 如果没有 API key 直接失败，因为后续所有 Turbopuffer 操作都无法进行。
+    # ————————————————————————————————————————
     def __init__(self, api_key: str | None = None, region: str | None = None):
         """Initialize Turbopuffer client."""
         self.api_key = api_key or settings.tpuf_api_key
@@ -258,14 +305,17 @@ class TurbopufferClient:
         from letta.services.agent_manager import AgentManager
         from letta.services.archive_manager import ArchiveManager
 
+        # ArchiveManager 用于把 archive_id 映射成稳定 namespace；AgentManager 用于部分业务场景里同步 agent 相关状态。
         self.archive_manager = ArchiveManager()
         self.agent_manager = AgentManager()
 
         if not self.api_key:
             raise ValueError("Turbopuffer API key not provided")
 
-    # 缓存预热用于降低首次检索延迟：调用方告诉 Turbopuffer 哪个 collection 和 scope 即将被查询，本方法解析 namespace 后发送 hint。
-    # 当前只支持 messages，因为 message 搜索是高频、低延迟敏感路径；其他 collection 如果未来需要也可以接入同一分发结构。
+    # ————————————————————————————————————————
+    # 这是查询前的低延迟优化入口：不是读取数据，而是提示 Turbopuffer 预热某个 namespace 的缓存。
+    # 目前只支持 messages collection，所以它先把 collection+scope 解析成真正 namespace，再调用 hint_cache_warm。
+    # ————————————————————————————————————————
     async def hint_cache_warm(self, *, collection: Literal["messages"], scope: dict[str, str]) -> dict:
         """Fire a cache warm hint for a supported search collection.
 
@@ -281,6 +331,7 @@ class TurbopufferClient:
         """
         from turbopuffer import AsyncTurbopuffer
 
+        # 预热前先解析 namespace，保证 hint 发到真实查询会使用的集合，而不是抽象 collection 名。
         namespace_name = await self._get_cache_warm_namespace_name(collection=collection, scope=scope)
 
         try:
@@ -292,7 +343,10 @@ class TurbopufferClient:
             logger.error(f"Failed to warm turbopuffer cache for collection {collection} in namespace {namespace_name}: {e}")
             raise
 
-    # cache warm 的入口使用 collection 名称，内部再转成实际 namespace。这样公开 API 不暴露 namespace 拼接细节。
+    # ————————————————————————————————————————
+    # 把外部传入的 collection/scope 映射到实际 TPUF namespace。
+    # 这里显式限制 collection 取值，是为了避免未来有人传入不支持的集合却默默预热错误 namespace。
+    # ————————————————————————————————————————
     async def _get_cache_warm_namespace_name(self, *, collection: Literal["messages"], scope: dict[str, str]) -> str:
         """Resolve the namespace for a supported cache-warm collection."""
         if collection == "messages":
@@ -303,9 +357,12 @@ class TurbopufferClient:
             argument_name="collection",
         )
 
-    # 所有写入和向量查询最终都复用这个 embedding 入口，保证 passage、message、tool 使用同一套默认 embedding 配置。
-    # 这里先过滤空字符串，是为了避免 embedding 服务收到无效输入，同时保持调用方可以传入原始批次后再由本层做清洗。
     @trace_method
+    # ————————————————————————————————————————
+    # 所有写入和向量查询都会走这里生成 embedding。
+    # 函数先剔除空字符串，避免向 embedding 服务发送无意义输入；然后使用 default_embedding_config 创建 LLMClient 请求向量。
+    # 返回的 embedding 顺序必须和过滤后的文本顺序一致，后续 zip 文本、ID、向量时依赖这个顺序。
+    # ————————————————————————————————————————
     async def _generate_embeddings(self, texts: List[str], actor: "PydanticUser") -> List[List[float]]:
         """Generate embeddings using the default embedding configuration.
 
@@ -318,14 +375,15 @@ class TurbopufferClient:
         """
         from letta.llm_api.llm_client import LLMClient
 
-        # embedding 调用按非空文本批量发起，所以返回向量数量对应 filtered_texts，而不是原始 texts。上层如果需要原始索引，要自行保留映射。
         # filter out empty strings after stripping
+        # 空文本不会参与 embedding；这一点会改变返回 embedding 的数量，所以调用方必须基于同样过滤后的文本进行 zip。
         filtered_texts = [text for text in texts if text.strip()]
 
         # skip embedding if no valid texts
         if not filtered_texts:
             return []
 
+        # embedding 客户端按 default_embedding_config 的 endpoint_type 创建，目前默认是 OpenAI。
         embedding_client = LLMClient.create(
             provider_type=self.default_embedding_config.embedding_endpoint_type,
             actor=actor,
@@ -333,15 +391,21 @@ class TurbopufferClient:
         embeddings = await embedding_client.request_embeddings(filtered_texts, self.default_embedding_config)
         return embeddings
 
-    # archive namespace 由 ArchiveManager 维护，通常和某个 agent 的长期归档记忆绑定，避免不同 archive 的 passage 混在同一个向量空间里。
     @trace_method
+    # ————————————————————————————————————————
+    # archival memory 的 namespace 不是简单拼字符串，而是由 ArchiveManager 管理和持久化。
+    # 这样同一个 archive_id 每次会解析到稳定的向量库 namespace。
+    # ————————————————————————————————————————
     async def _get_archive_namespace_name(self, archive_id: str) -> str:
         """Get namespace name for a specific archive."""
         return await self.archive_manager.get_or_set_vector_db_namespace_async(archive_id)
 
-    # messages 使用组织级 namespace，而不是 agent 级 namespace。这样可以支持组织级搜索，同时通过 agent_id / conversation_id 等字段过滤具体范围。
-    # environment 被拼进 namespace，是为了隔离 dev/staging/prod 等环境，避免同一组织的数据在不同部署间互相污染。
     @trace_method
+    # ————————————————————————————————————————
+    # messages namespace 以 organization 为边界，而不是以 agent 为边界；agent_id 会作为查询 filter。
+    # 这使得同一组织内可以做跨 agent 搜索，同时仍能通过 agent_id 过滤到单个 agent。
+    # environment 后缀用于区分 dev/staging/prod，避免不同环境的数据写到同一个 namespace。
+    # ————————————————————————————————————————
     async def _get_message_namespace_name(self, organization_id: str) -> str:
         """Get namespace name for messages (org-scoped).
 
@@ -351,6 +415,7 @@ class TurbopufferClient:
         Returns:
             The org-scoped namespace name for messages
         """
+        # namespace 命名都考虑 environment，是为了让同一个 organization 在不同部署环境中拥有隔离索引。
         environment = settings.environment
         if environment:
             namespace_name = f"messages_{organization_id}_{environment.lower()}"
@@ -359,8 +424,11 @@ class TurbopufferClient:
 
         return namespace_name
 
-    # tools 也按组织隔离，因为工具库通常属于组织或工作区级资源；查询时再用 tool_type、tags 等字段进一步过滤。
     @trace_method
+    # ————————————————————————————————————————
+    # tools namespace 也按 organization 隔离，便于在组织范围内做工具语义检索。
+    # 和 message namespace 一样，environment 后缀用于防止环境之间互相污染。
+    # ————————————————————————————————————————
     async def _get_tool_namespace_name(self, organization_id: str) -> str:
         """Get namespace name for tools (org-scoped).
 
@@ -370,6 +438,7 @@ class TurbopufferClient:
         Returns:
             The org-scoped namespace name for tools
         """
+        # namespace 命名都考虑 environment，是为了让同一个 organization 在不同部署环境中拥有隔离索引。
         environment = settings.environment
         if environment:
             namespace_name = f"tools_{organization_id}_{environment.lower()}"
@@ -378,8 +447,11 @@ class TurbopufferClient:
 
         return namespace_name
 
-    # tool 不能只按名称 embedding，否则语义搜索很难命中“能做什么”。这里把名称、描述、schema 参数和 tags 拼成结构化 JSON，作为可检索语义文本。
-    # 参数描述被展开进文本，是为了让“找一个能按日期搜索消息的工具”这类查询可以命中参数能力，而不仅仅命中工具名。
+    # ————————————————————————————————————————
+    # 工具对象不能只拿 name 做 embedding，否则检索时语义信息太少。
+    # 这里把工具名、描述、schema 描述、参数说明和 tags 合成一个 JSON 字符串，让向量检索能理解“这个工具能做什么、参数怎么用”。
+    # 后续 insert_tools 会把这个 JSON 作为 text 字段写入 TPUF，并开启 full-text search。
+    # ————————————————————————————————————————
     def _extract_tool_text(self, tool: "PydanticTool") -> str:
         """Extract searchable text from a tool for embedding.
 
@@ -393,6 +465,7 @@ class TurbopufferClient:
             JSON-formatted string containing tool information
         """
 
+        # 先放入工具最基础的可搜索信息，后续再按 schema 和 tags 增强语义。
         parts = {
             "name": tool.name or "",
             "description": tool.description or "",
@@ -406,6 +479,7 @@ class TurbopufferClient:
                 parts["schema_description"] = schema_description
 
             # Extract parameter information
+            # 参数描述会显著提升工具检索质量：用户通常按“能做什么”搜索，而不是准确记得工具名。
             parameters = tool.json_schema.get("parameters", {})
             if parameters:
                 properties = parameters.get("properties", {})
@@ -426,10 +500,13 @@ class TurbopufferClient:
 
         return json.dumps(parts)
 
-    # tools 写入流程和 passage/message 类似，但文本来源是工具 schema。先抽取可搜索文本并过滤空工具，再批量生成 embedding。
-    # 最终写入采用列式 upsert_columns，既适合 Turbopuffer 批处理，也能保留 name、tool_type、tags 这些后续过滤字段。
     @trace_method
     @async_retry_with_backoff()
+    # ————————————————————————————————————————
+    # 工具写入流程：先把工具定义转成可检索文本，再生成 embedding，最后以列式 upsert 写入 org-scoped tools namespace。
+    # 它是批量写入方法，所以所有字段都先累积成数组，和 Turbopuffer 的 upsert_columns 结构对齐。
+    # 外层装饰器会处理 transient 错误重试，内部 semaphore + to_thread 则负责保护并发和事件循环。
+    # ————————————————————————————————————————
     async def insert_tools(
         self,
         tools: List["PydanticTool"],
@@ -447,10 +524,12 @@ class TurbopufferClient:
             True if successful
         """
 
+        # 空列表是合法输入，直接返回成功，避免上层还要额外判断是否有工具需要索引。
         if not tools:
             return True
 
         # Extract text and filter out empty content
+        # 这里并行维护 valid_tools 和 tool_texts，是为了过滤掉无法产生检索文本的工具，同时保持 tool/text/embedding 后续一一对应。
         tool_texts = []
         valid_tools = []
         for tool in tools:
@@ -463,13 +542,12 @@ class TurbopufferClient:
             logger.warning("All tools had empty text content, skipping insertion")
             return True
 
-        # 写入前统一先生成向量，随后文本和向量会以同样顺序 zip 回业务对象，保证列式数据对齐。
         # Generate embeddings
+        # 工具文本准备好后才生成 embedding；生成失败会由外层 retry 装饰器判断是否重试。
         embeddings = await self._generate_embeddings(tool_texts, actor)
 
         namespace_name = await self._get_tool_namespace_name(organization_id)
 
-        # Turbopuffer 的批量写入采用列式结构，因此下面不是逐条构造对象，而是把每个字段分别收集成等长数组。
         # Prepare column-based data
         ids = []
         vectors = []
@@ -490,6 +568,8 @@ class TurbopufferClient:
             tags_arrays.append(tool.tags or [])
             created_ats.append(getattr(tool, "created_at", None) or datetime.now(timezone.utc))
 
+        # Turbopuffer 写入采用列式格式：每个字段是一列数组，同一索引位置代表同一条记录。
+        # 因此前面所有 ids/vectors/texts 等列表必须保持长度一致、顺序一致。
         upsert_columns = {
             "id": ids,
             "vector": vectors,
@@ -503,8 +583,10 @@ class TurbopufferClient:
 
         try:
             # Use global semaphore to limit concurrent Turbopuffer writes
+            # 写 TPUF 前先拿全局 semaphore，限制并发写入数量，避免批量 embedding 完成后同时冲击向量库。
             async with _GLOBAL_TURBOPUFFER_SEMAPHORE:
                 # Run in thread pool to prevent CPU-intensive base64 encoding from blocking event loop
+                # 真正的 TPUF write 放到线程池执行，这是本文件的核心性能设计：避免向量序列化阻塞 asyncio event loop。
                 await asyncio.to_thread(
                     _run_turbopuffer_write_in_thread,
                     api_key=self.api_key,
@@ -521,10 +603,13 @@ class TurbopufferClient:
             logger.error(f"Failed to insert tools to Turbopuffer: {e}")
             raise
 
-    # archival memory 是长期记忆的写入路径。调用方传入原始 text_chunks 和已分配好的 passage_ids，本方法负责过滤空 chunk、补齐/复用 embedding，并写入 archive namespace。
-    # passage_ids 要求和 text_chunks 一一对应，是为了和数据库侧 passage 记录保持 dual-write 一致：即使过滤掉空文本，也能回到原始索引找到正确 ID。
     @trace_method
     @async_retry_with_backoff()
+    # ————————————————————————————————————————
+    # 这是 archival memory 的写入主路径，负责把已经切好的 text_chunks 写入指定 archive 的 TPUF namespace。
+    # 它强调 dual-write 一致性：passage_ids 必须由外部提供并与 text_chunks 一一对应，便于数据库 passage 与 TPUF 向量记录使用同一个 ID。
+    # 如果调用方提供了 embedding 且维度正确，则复用；否则重新生成，防止维度不匹配导致 TPUF 写入失败。
+    # ————————————————————————————————————————
     async def insert_archival_memories(
         self,
         archive_id: str,
@@ -552,8 +637,8 @@ class TurbopufferClient:
             List of PydanticPassage objects that were inserted
         """
 
-        # 空 chunk 不参与 embedding 和写入，但保留 original_idx，后面才能从 passage_ids 中取回原始位置对应的 ID。
         # filter out empty text chunks
+        # 过滤时保留原始索引 i，因为 passage_ids 和可选 embeddings 仍然是按原始 text_chunks 对齐的。
         filtered_chunks = [(i, text) for i, text in enumerate(text_chunks) if text.strip()]
 
         if not filtered_chunks:
@@ -562,9 +647,9 @@ class TurbopufferClient:
 
         filtered_texts = [text for _, text in filtered_chunks]
 
-        # 允许调用方传入预计算 embedding，但只有维度完全匹配时才复用；否则宁愿重新生成，也不把坏向量写进索引。
         # use provided embeddings only if dimensions match TPUF's expected dimension
         use_provided_embeddings = False
+        # 如果外部传入 embedding，先做长度和维度验证；只在安全时复用，避免写入维度不符合 namespace schema。
         if embeddings is not None:
             if len(embeddings) != len(text_chunks):
                 raise LettaInvalidArgumentError(
@@ -572,6 +657,7 @@ class TurbopufferClient:
                     argument_name="embeddings",
                 )
             # check if first non-empty embedding has correct dimensions
+            # 通过 filtered_indices 从原始 embeddings 中取出与非空文本对应的向量，保证空 chunk 被跳过后仍然能对齐。
             filtered_indices = [i for i, _ in filtered_chunks]
             sample_embedding = embeddings[filtered_indices[0]] if filtered_indices else None
             if sample_embedding is not None and len(sample_embedding) == self.default_embedding_config.embedding_dim:
@@ -589,6 +675,7 @@ class TurbopufferClient:
         namespace_name = await self._get_archive_namespace_name(archive_id)
 
         # handle timestamp - ensure UTC
+        # 写入时间统一归一到 UTC，后续时间过滤也会转 UTC，这样跨时区查询不会产生偏差。
         if created_at is None:
             timestamp = datetime.now(timezone.utc)
         else:
@@ -600,8 +687,8 @@ class TurbopufferClient:
                 # convert to UTC if in different timezone
                 timestamp = created_at.astimezone(timezone.utc)
 
-        # 这两个长度检查保护数据库和 Turbopuffer 的双写一致性：任一侧的 ID/文本错位都会让后续删除或回查变得不可靠。
         # passage_ids must be provided for dual-write consistency
+        # passage_id 是数据库与 TPUF 双写一致性的锚点，缺失时不能继续写入。
         if not passage_ids:
             raise ValueError("passage_ids must be provided for Turbopuffer insertion")
         if len(passage_ids) != len(text_chunks):
@@ -630,6 +717,7 @@ class TurbopufferClient:
             tags_arrays.append(tags or [])  # Store tags as array
 
             # Create PydanticPassage object
+            # 写入 TPUF 的同时构造 PydanticPassage 返回给调用方，让上层不用再从 TPUF 读一次就能拿到插入结果。
             passage = PydanticPassage(
                 id=passage_id,
                 text=text,
@@ -644,6 +732,8 @@ class TurbopufferClient:
             passages.append(passage)
 
         # build column-based upsert data
+        # Turbopuffer 写入采用列式格式：每个字段是一列数组，同一索引位置代表同一条记录。
+        # 因此前面所有 ids/vectors/texts 等列表必须保持长度一致、顺序一致。
         upsert_columns = {
             "id": ids,
             "vector": vectors,
@@ -656,8 +746,10 @@ class TurbopufferClient:
 
         try:
             # Use global semaphore to limit concurrent Turbopuffer writes
+            # 写 TPUF 前先拿全局 semaphore，限制并发写入数量，避免批量 embedding 完成后同时冲击向量库。
             async with _GLOBAL_TURBOPUFFER_SEMAPHORE:
                 # Run in thread pool to prevent CPU-intensive base64 encoding from blocking event loop
+                # 真正的 TPUF write 放到线程池执行，这是本文件的核心性能设计：避免向量序列化阻塞 asyncio event loop。
                 await asyncio.to_thread(
                     _run_turbopuffer_write_in_thread,
                     api_key=self.api_key,
@@ -677,10 +769,13 @@ class TurbopufferClient:
                 logger.error("Duplicate passage IDs detected in batch")
             raise
 
-    # message 写入是对话搜索的索引路径：MessageManager 先抽取可搜索文本，再把 message_id、role、agent_id、conversation_id 等元数据一起写进组织级 namespace。
-    # 这里保留 project/template/conversation 字段为可选列，方便同一个组织 namespace 内做更细粒度过滤，而不需要为每个维度创建新 namespace。
     @trace_method
     @async_retry_with_backoff()
+    # ————————————————————————————————————————
+    # 这是消息 embedding 的写入路径，通常由 MessageManager 在创建/更新消息后异步调用。
+    # messages namespace 是 organization-scoped，因此每条记录必须带 agent_id、role、created_at，查询时再用这些字段过滤。
+    # conversation_id、project_id、template_id 是可选列：只有传入时才写入，避免旧数据或未启用场景被迫携带空字段。
+    # ————————————————————————————————————————
     async def insert_messages(
         self,
         agent_id: str,
@@ -713,6 +808,7 @@ class TurbopufferClient:
         """
 
         # filter out empty message texts
+        # 消息文本也会跳过空内容，但必须保留原始索引以便回到 message_ids/roles/created_ats/conversation_ids。
         filtered_messages = [(i, text) for i, text in enumerate(message_texts) if text.strip()]
 
         if not filtered_messages:
@@ -725,10 +821,10 @@ class TurbopufferClient:
 
         namespace_name = await self._get_message_namespace_name(organization_id)
 
-        # message 索引的元数据列很多，先做长度校验可以在写入前发现错位，避免某条消息拿到另一条消息的角色或时间戳。
         # validation checks
         if not message_ids:
             raise ValueError("message_ids must be provided for Turbopuffer insertion")
+        # 消息写入对字段长度要求非常严格；任何一列错位都会导致 id、role、时间戳与向量文本绑定错误。
         if len(message_ids) != len(message_texts):
             raise ValueError(f"message_ids length ({len(message_ids)}) must match message_texts length ({len(message_texts)})")
         if len(message_ids) != len(roles):
@@ -755,6 +851,7 @@ class TurbopufferClient:
             message_id = message_ids[original_idx]
             role = roles[original_idx]
             created_at = created_ats[original_idx]
+            # conversation_id 是可选上下文隔离字段；没有传时保持 None，兼容默认/历史消息。
             conversation_id = conversation_ids[original_idx] if conversation_ids else None
 
             # ensure the provided timestamp is timezone-aware and in UTC
@@ -779,6 +876,8 @@ class TurbopufferClient:
             is_deleted_list.append(False)
 
         # build column-based upsert data
+        # Turbopuffer 写入采用列式格式：每个字段是一列数组，同一索引位置代表同一条记录。
+        # 因此前面所有 ids/vectors/texts 等列表必须保持长度一致、顺序一致。
         upsert_columns = {
             "id": ids,
             "vector": vectors,
@@ -791,6 +890,7 @@ class TurbopufferClient:
         }
 
         # only include conversation_id if it's provided
+        # 只有明确启用 conversation 维度时才写 conversation_id 列，避免旧 namespace 或旧数据路径被迫承担该字段。
         if conversation_ids is not None:
             upsert_columns["conversation_id"] = conversation_ids_list
 
@@ -804,8 +904,10 @@ class TurbopufferClient:
 
         try:
             # Use global semaphore to limit concurrent Turbopuffer writes
+            # 写 TPUF 前先拿全局 semaphore，限制并发写入数量，避免批量 embedding 完成后同时冲击向量库。
             async with _GLOBAL_TURBOPUFFER_SEMAPHORE:
                 # Run in thread pool to prevent CPU-intensive base64 encoding from blocking event loop
+                # 真正的 TPUF write 放到线程池执行，这是本文件的核心性能设计：避免向量序列化阻塞 asyncio event loop。
                 await asyncio.to_thread(
                     _run_turbopuffer_write_in_thread,
                     api_key=self.api_key,
@@ -829,10 +931,13 @@ class TurbopufferClient:
                 logger.error("Duplicate message IDs detected in batch")
             raise
 
-    # 所有查询最终都汇聚到这个通用执行器。上层只决定 namespace、搜索模式、过滤器和需要返回的属性；这里负责把它翻译成 Turbopuffer query / multi_query。
-    # vector、fts、hybrid、timestamp 四种模式共享同一个校验入口，避免不同数据类型的查询方法对参数合法性的理解不一致。
     @trace_method
     @async_retry_with_backoff()
+    # ————————————————————————————————————————
+    # 这是所有查询方法的统一底层执行器，屏蔽 vector / FTS / hybrid / timestamp 四种 Turbopuffer 查询形态差异。
+    # 上层方法只负责准备 query_embedding、query_text、filters 和 include_attributes；真正调用 namespace.query 或 multi_query 都集中在这里。
+    # hybrid 模式会同时发起 ANN 向量查询和 BM25 全文查询，返回两个结果列表，后续再用 RRF 融合。
+    # ————————————————————————————————————————
     async def _execute_query(
         self,
         namespace_name: str,
@@ -864,12 +969,13 @@ class TurbopufferClient:
         from turbopuffer import AsyncTurbopuffer
         from turbopuffer.types import QueryParam
 
-        # 不同 search_mode 对输入的要求不同：vector 需要 query_embedding，FTS 需要 query_text，hybrid 两者都需要。先校验可以让错误更靠近调用点。
         # validate inputs based on search mode
+        # 执行查询前先做模式-参数校验，避免向 TPUF 发出不完整请求后得到更难理解的底层错误。
         if search_mode == "vector" and query_embedding is None:
             raise ValueError("query_embedding is required for vector search mode")
         if search_mode == "fts" and query_text is None:
             raise ValueError("query_text is required for FTS search mode")
+        # 混合检索结果需要特殊处理：result.results[0] 和 result.results[1] 分别对应前面构造的 vector 与 FTS 查询。
         if search_mode == "hybrid":
             if query_embedding is None or query_text is None:
                 raise ValueError("Both query_embedding and query_text are required for hybrid search mode")
@@ -880,7 +986,7 @@ class TurbopufferClient:
             async with AsyncTurbopuffer(api_key=self.api_key, region=self.region) as client:
                 namespace = client.namespace(namespace_name)
 
-                # timestamp 模式不做相关性搜索，而是把 created_at 当排序键，用同一套查询接口支持“最近记录”列表。
+                # timestamp 模式不是语义搜索，而是按 created_at 倒序取最近记录，通常用于无 query 的兜底读取。
                 if search_mode == "timestamp":
                     # retrieve most recent items by timestamp
                     query_params = {
@@ -892,6 +998,7 @@ class TurbopufferClient:
                         query_params["filters"] = filters
                     return await namespace.query(**query_params)
 
+                # vector 模式使用 ANN 近似最近邻，适合按语义相似度找内容。
                 elif search_mode == "vector":
                     # vector search query
                     query_params = {
@@ -903,6 +1010,7 @@ class TurbopufferClient:
                         query_params["filters"] = filters
                     return await namespace.query(**query_params)
 
+                # FTS 模式使用 BM25 全文搜索，适合关键词精确匹配或专有名词检索。
                 elif search_mode == "fts":
                     # full-text search query
                     query_params = {
@@ -914,7 +1022,7 @@ class TurbopufferClient:
                         query_params["filters"] = filters
                     return await namespace.query(**query_params)
 
-                # hybrid 不让 Turbopuffer替我们合并分数，而是分别取 vector 和 BM25 结果，后面用本地 RRF 统一排名。
+                # hybrid 模式同时保留语义召回和关键词召回，后续用 RRF 融合，通常是最稳妥的默认搜索方式。
                 else:  # hybrid mode
                     queries = []
 
@@ -939,6 +1047,7 @@ class TurbopufferClient:
                     queries.append(fts_query)
 
                     # execute multi-query
+                    # multi_query 会一次返回两个结果集：第一个是 vector，第二个是 FTS；后续处理函数依赖这个顺序。
                     return await namespace.multi_query(queries=[QueryParam(**q) for q in queries])
         except Exception as e:
             # Wrap turbopuffer errors with user-friendly messages
@@ -953,9 +1062,12 @@ class TurbopufferClient:
             # Re-raise other errors as-is
             raise
 
-    # 这是 archive passage 的查询入口。它先根据 search_mode 决定是否需要为 query_text 生成 embedding，然后把 tags 和时间范围转成 Turbopuffer filter。
-    # hybrid 模式会分别跑向量检索和全文检索，再用 RRF 合并排序；单一模式则直接把 Turbopuffer 行还原成 PydanticPassage。
     @trace_method
+    # ————————————————————————————————————————
+    # 这是 archival memory 的读取主路径，支持向量检索、全文检索、混合检索，以及没有 query 时按时间取最近内容。
+    # 它会把 tags、时间范围组合成 TPUF filter；ALL/ANY tag 语义分别对应 And+Contains 与 ContainsAny。
+    # 返回值统一为 (PydanticPassage, score, metadata)，方便上层展示相关度和排名来源。
+    # ————————————————————————————————————————
     async def query_passages(
         self,
         archive_id: str,
@@ -990,20 +1102,22 @@ class TurbopufferClient:
         """
         # generate embedding for vector/hybrid search if query_text is provided
         query_embedding = None
+        # 只有 vector/hybrid 需要 query embedding；纯 FTS 直接使用 query_text，不额外消耗 embedding 请求。
         if query_text and search_mode in ["vector", "hybrid"]:
             embeddings = await self._generate_embeddings([query_text], actor)
             query_embedding = embeddings[0]
 
         # Check if we should fallback to timestamp-based retrieval
+        # 没有查询文本时自动切到 timestamp，保证调用方可以用同一个接口“搜索或取最近内容”。
         if query_embedding is None and query_text is None and search_mode not in ["timestamp"]:
             # Fallback to retrieving most recent passages when no search query is provided
             search_mode = "timestamp"
 
         namespace_name = await self._get_archive_namespace_name(archive_id)
 
-        # tags 过滤先独立构造，再和时间过滤合并。这样 ANY / ALL 的语义不会被日期条件打乱。
         # build tag filter conditions
         tag_filter = None
+        # tags 是 archival memory 的重要缩小范围手段；它在 TPUF 层做过滤，而不是拿结果后再本地过滤。
         if tags:
             if tag_match_mode == TagMatchMode.ALL:
                 # For ALL mode, need to check each tag individually with Contains
@@ -1020,6 +1134,7 @@ class TurbopufferClient:
 
         # build date filter conditions
         date_filters = []
+        # 时间过滤在写入和查询两端都统一到 UTC，确保用户本地时间输入不会和存储时区混淆。
         if start_date:
             # Convert to UTC to match stored timestamps
             if start_date.tzinfo is not None:
@@ -1038,8 +1153,8 @@ class TurbopufferClient:
                 end_date = end_date.astimezone(timezone.utc)
             date_filters.append(("created_at", "Lte", end_date))
 
-        # Turbopuffer filter 最终只能接收一个表达式，所以多个条件统一折叠成 And。只有一个条件时则直接传递，避免不必要的嵌套。
         # combine all filters
+        # 组织级查询没有强制 agent_id，所以 filter 从空列表开始，再按调用方传入条件逐步收窄。
         all_filters = []
         if tag_filter:
             all_filters.append(tag_filter)
@@ -1047,6 +1162,7 @@ class TurbopufferClient:
             all_filters.extend(date_filters)
 
         # create final filter expression
+        # filter 最终要么为空、单个条件，要么是 ("And", [...])；这是 Turbopuffer filter 表达式的预期结构。
         final_filter = None
         if len(all_filters) == 1:
             final_filter = all_filters[0]
@@ -1068,7 +1184,7 @@ class TurbopufferClient:
             )
 
             # process results based on search mode
-            # 查询结果处理分两路：hybrid 拿到 multi_query 的两个 result 集合；单一模式只处理一个 rows 列表。
+            # 混合检索结果需要特殊处理：result.results[0] 和 result.results[1] 分别对应前面构造的 vector 与 FTS 查询。
             if search_mode == "hybrid":
                 # for hybrid mode, we get a multi-query response
                 vector_results = self._process_single_query_results(result.results[0], archive_id, tags)
@@ -1102,12 +1218,15 @@ class TurbopufferClient:
             logger.error(f"Failed to query passages from Turbopuffer: {e}")
             raise
 
-    # 这是 agent 级消息搜索入口：namespace 仍是组织级，但 agent_id 永远作为过滤条件存在，保证只检索当前 agent 的消息。
-    # 除了角色、项目、模板、时间过滤，还专门处理 conversation_id 的三态语义：不传表示全量，default 表示旧式默认消息，具体 ID 表示某个隔离会话。
     @trace_method
     # TODO: Once existing TPUF namespaces are backfilled with is_deleted attribute,
     # add is_deleted=False filter to query_messages_by_agent_id and query_messages_by_org_id.
     # Until then, soft-deleted messages are filtered out via DB post-filter in MessageManager.search_messages_async.
+    # ————————————————————————————————————————
+    # 这是单个 agent 的消息检索路径，但实际 namespace 仍是 organization 级别。
+    # 因此必须把 agent_id 作为固定 filter，再叠加 role/project/template/conversation/date 等可选过滤条件。
+    # hybrid 查询会分别拿向量结果和 FTS 结果，再用 _reciprocal_rank_fusion 合并，避免单一检索方式偏置。
+    # ————————————————————————————————————————
     async def query_messages_by_agent_id(
         self,
         agent_id: str,
@@ -1151,19 +1270,21 @@ class TurbopufferClient:
         """
         # generate embedding for vector/hybrid search if query_text is provided
         query_embedding = None
+        # 只有 vector/hybrid 需要 query embedding；纯 FTS 直接使用 query_text，不额外消耗 embedding 请求。
         if query_text and search_mode in ["vector", "hybrid"]:
             embeddings = await self._generate_embeddings([query_text], actor)
             query_embedding = embeddings[0]
 
         # Check if we should fallback to timestamp-based retrieval
+        # 没有查询文本时自动切到 timestamp，保证调用方可以用同一个接口“搜索或取最近内容”。
         if query_embedding is None and query_text is None and search_mode not in ["timestamp"]:
             # Fallback to retrieving most recent messages when no search query is provided
             search_mode = "timestamp"
 
         namespace_name = await self._get_message_namespace_name(organization_id)
 
-        # agent_id 是 agent 级消息搜索的硬边界，后续所有可选过滤条件都在这个基础上继续收窄。
         # build agent_id filter
+        # 单 agent 查询必须强制加 agent_id filter，因为 messages namespace 是组织级共享的。
         agent_filter = ("agent_id", "Eq", agent_id)
 
         # build role filter conditions
@@ -1177,6 +1298,7 @@ class TurbopufferClient:
 
         # build date filter conditions
         date_filters = []
+        # 时间过滤在写入和查询两端都统一到 UTC，确保用户本地时间输入不会和存储时区混淆。
         if start_date:
             # Convert to UTC to match stored timestamps
             if start_date.tzinfo is not None:
@@ -1205,12 +1327,12 @@ class TurbopufferClient:
         if template_id:
             template_filter = ("template_id", "Eq", template_id)
 
-        # conversation_id 在这里既兼容旧数据（default/None），也支持 V3 的隔离 conversation。不同语义必须转成不同 filter。
         # build conversation_id filter if provided
         # three cases:
         # 1. conversation_id=None (omitted) -> return all messages (no filter)
         # 2. conversation_id="default" -> return only default messages (conversation_id is none), for backward compatibility
         # 3. conversation_id="xyz" -> return only messages in that conversation
+        # conversation_id 有三态语义：不传表示不过滤；"default" 表示只看默认会话；具体值表示只看某个 conversation。
         conversation_filter = None
         if conversation_id == "default":
             # "default" is reserved for default messages only (conversation_id is none)
@@ -1219,8 +1341,8 @@ class TurbopufferClient:
             # Specific conversation
             conversation_filter = ("conversation_id", "Eq", conversation_id)
 
-        # Turbopuffer filter 最终只能接收一个表达式，所以多个条件统一折叠成 And。只有一个条件时则直接传递，避免不必要的嵌套。
         # combine all filters
+        # 从必选 agent_filter 开始叠加条件，保证无论有没有其它 filter，都不会跨 agent 泄露结果。
         all_filters = [agent_filter]  # always include agent_id filter
         if role_filter:
             all_filters.append(role_filter)
@@ -1234,6 +1356,7 @@ class TurbopufferClient:
             all_filters.extend(date_filters)
 
         # create final filter expression
+        # filter 最终要么为空、单个条件，要么是 ("And", [...])；这是 Turbopuffer filter 表达式的预期结构。
         final_filter = None
         if len(all_filters) == 1:
             final_filter = all_filters[0]
@@ -1255,7 +1378,7 @@ class TurbopufferClient:
             )
 
             # process results based on search mode
-            # 查询结果处理分两路：hybrid 拿到 multi_query 的两个 result 集合；单一模式只处理一个 rows 列表。
+            # 混合检索结果需要特殊处理：result.results[0] 和 result.results[1] 分别对应前面构造的 vector 与 FTS 查询。
             if search_mode == "hybrid":
                 # for hybrid mode, we get a multi-query response
                 vector_results = self._process_message_query_results(result.results[0])
@@ -1289,8 +1412,11 @@ class TurbopufferClient:
             logger.error(f"Failed to query messages from Turbopuffer: {e}")
             raise
 
-    # 这是组织级消息搜索入口，不强制 agent_id，因此可以跨 agent 查消息。它和 agent 级查询复用同一套组织 namespace，只是过滤条件更开放。
-    # hybrid 结果会额外把 vector/FTS 原始分数补进 metadata，便于上层调试为什么某条消息被排到前面。
+    # ————————————————————————————————————————
+    # 这是组织级消息检索路径，不强制 agent_id，因此可以跨 agent 搜索。
+    # 它和 query_messages_by_agent_id 的区别主要在 filter 组合：agent_id 只是可选条件，而不是必选条件。
+    # 返回结果仍是 message_dict + score + metadata，供 MessageManager 再映射回数据库里的完整 Message 对象。
+    # ————————————————————————————————————————
     async def query_messages_by_org_id(
         self,
         organization_id: str,
@@ -1337,11 +1463,13 @@ class TurbopufferClient:
         """
         # generate embedding for vector/hybrid search if query_text is provided
         query_embedding = None
+        # 只有 vector/hybrid 需要 query embedding；纯 FTS 直接使用 query_text，不额外消耗 embedding 请求。
         if query_text and search_mode in ["vector", "hybrid"]:
             embeddings = await self._generate_embeddings([query_text], actor)
             query_embedding = embeddings[0]
 
         # Check if we should fallback to timestamp-based retrieval
+        # 没有查询文本时自动切到 timestamp，保证调用方可以用同一个接口“搜索或取最近内容”。
         if query_embedding is None and query_text is None and search_mode not in ["timestamp"]:
             # Fallback to retrieving most recent messages when no search query is provided
             search_mode = "timestamp"
@@ -1350,6 +1478,7 @@ class TurbopufferClient:
         namespace_name = await self._get_message_namespace_name(organization_id)
 
         # build filters
+        # 组织级查询没有强制 agent_id，所以 filter 从空列表开始，再按调用方传入条件逐步收窄。
         all_filters = []
 
         # role filter
@@ -1385,6 +1514,7 @@ class TurbopufferClient:
             all_filters.append(("conversation_id", "Eq", conversation_id))
 
         # date filters
+        # 时间过滤在写入和查询两端都统一到 UTC，确保用户本地时间输入不会和存储时区混淆。
         if start_date:
             # Convert to UTC to match stored timestamps
             if start_date.tzinfo is not None:
@@ -1402,6 +1532,7 @@ class TurbopufferClient:
             all_filters.append(("created_at", "Lte", end_date))
 
         # combine filters
+        # filter 最终要么为空、单个条件，要么是 ("And", [...])；这是 Turbopuffer filter 表达式的预期结构。
         final_filter = None
         if len(all_filters) == 1:
             final_filter = all_filters[0]
@@ -1423,7 +1554,7 @@ class TurbopufferClient:
             )
 
             # process results based on search mode
-            # 查询结果处理分两路：hybrid 拿到 multi_query 的两个 result 集合；单一模式只处理一个 rows 列表。
+            # 混合检索结果需要特殊处理：result.results[0] 和 result.results[1] 分别对应前面构造的 vector 与 FTS 查询。
             if search_mode == "hybrid":
                 # for hybrid mode, we get a multi-query response
                 vector_results = self._process_message_query_results(result.results[0])
@@ -1440,6 +1571,7 @@ class TurbopufferClient:
                 )
 
                 # add raw scores to metadata if available
+                # RRF 主要用排名融合；这里额外保留原始 vector/FTS 分数，方便调试排序质量。
                 vector_scores = {}
                 for row in result.results[0].rows:
                     if hasattr(row, "dist"):
@@ -1486,7 +1618,10 @@ class TurbopufferClient:
             logger.error(f"Failed to query messages from Turbopuffer: {e}")
             raise
 
-    # Turbopuffer 返回的是行对象，这里把它压成轻量 dict。RRF 合并只依赖 id 和顺序，最终展示再由 MessageManager 回查数据库或直接使用嵌入文本。
+    # ————————————————————————————————————————
+    # 把 Turbopuffer 原始 row 转成轻量 message dict。
+    # 这个 dict 不是完整 Message 模型，只保留检索展示和后续回表所需字段；RRF 融合主要依赖 id。
+    # ————————————————————————————————————————
     def _process_message_query_results(self, result) -> List[dict]:
         """Process results from a message query into message dicts.
 
@@ -1494,6 +1629,7 @@ class TurbopufferClient:
         """
         messages = []
 
+        # 所有 _process_* 方法都在这里把 TPUF row 的动态属性转成 Letta 明确的数据结构。
         for row in result.rows:
             # Build message dict with key fields
             message_dict = {
@@ -1509,13 +1645,18 @@ class TurbopufferClient:
 
         return messages
 
-    # archive passage 查询结果在这里重新包装为 PydanticPassage。注意 embedding 不从 Turbopuffer 返回，所以对象里只填空 embedding 和默认配置，保留文本与元数据即可。
+    # ————————————————————————————————————————
+    # 把 archival passage 查询结果转回 PydanticPassage。
+    # TPUF 查询通常不会返回 embedding，所以这里用空 embedding 占位，同时保留 text、tags、created_at 等可展示字段。
+    # 向量搜索返回距离，需要转成相似度；FTS 返回 BM25 score，直接作为得分。
+    # ————————————————————————————————————————
     def _process_single_query_results(
         self, result, archive_id: str, tags: Optional[List[str]], is_fts: bool = False
     ) -> List[Tuple[PydanticPassage, float]]:
         """Process results from a single query into passage objects with scores."""
         passages_with_scores = []
 
+        # 所有 _process_* 方法都在这里把 TPUF row 的动态属性转成 Letta 明确的数据结构。
         for row in result.rows:
             # Extract tags from the result row
             passage_tags = getattr(row, "tags", []) or []
@@ -1524,6 +1665,7 @@ class TurbopufferClient:
             metadata = {}
 
             # Create a passage with minimal fields - embeddings are not returned from Turbopuffer
+            # 写入 TPUF 的同时构造 PydanticPassage 返回给调用方，让上层不用再从 TPUF 读一次就能拿到插入结果。
             passage = PydanticPassage(
                 id=row.id,
                 text=getattr(row, "text", ""),
@@ -1543,6 +1685,7 @@ class TurbopufferClient:
                 score = getattr(row, "$score", 0.0)
             else:
                 # for vector search, convert distance to similarity score
+                # Turbopuffer 向量检索返回的是距离，代码将其转换成 1 - distance 的相似度形式，便于上层理解。
                 distance = getattr(row, "$dist", 0.0)
                 score = 1.0 - distance
 
@@ -1550,8 +1693,11 @@ class TurbopufferClient:
 
         return passages_with_scores
 
-    # RRF 用“名次”而不是原始分数合并向量检索和全文检索，能减少不同打分尺度之间不可比的问题。
-    # 调用方传入 get_id_func，因此同一套合并逻辑可复用于 passage、message dict、tool dict 等不同对象类型。
+    # ————————————————————————————————————————
+    # RRF 是 hybrid 检索的关键：它不直接比较向量距离和 BM25 分数，而是比较两边的排名。
+    # 这样可以避免不同检索算法的原始分数尺度不一致；一个结果只要在任一列表排名靠前，就会得到较高融合分。
+    # metadata 会记录 vector_rank 和 fts_rank，方便上层解释结果为什么排在这里。
+    # ————————————————————————————————————————
     def _reciprocal_rank_fusion(
         self,
         vector_results: List[Any],
@@ -1580,11 +1726,12 @@ class TurbopufferClient:
             List of (item, score, metadata) tuples sorted by RRF score
             metadata contains ranks from each result list
         """
+        # RRF 常数 k 越大，排名差异影响越平滑；60 是常见默认值，可以降低单一高排名的极端支配。
         k = 60  # standard RRF constant from Cormack et al. (2009)
 
-        # RRF 只看列表排名，所以第一步把每个结果在 vector/FTS 中的名次记录下来；同一个 ID 可能只出现在其中一个列表。
         # create rank mappings based on position in result lists
         # rank starts at 1, not 0
+        # RRF 只关心“第几名”，所以先把结果列表转换成 id -> rank 映射。
         vector_ranks = {get_id_func(item): rank + 1 for rank, item in enumerate(vector_results)}
         fts_ranks = {get_id_func(item): rank + 1 for rank, item in enumerate(fts_results)}
 
@@ -1595,7 +1742,6 @@ class TurbopufferClient:
         for item in fts_results:
             all_items[get_id_func(item)] = item
 
-        # 分数越靠前贡献越大；如果某条记录只被一种检索方式召回，也能得到该检索方式的一部分分数。
         # calculate RRF scores based purely on ranks
         rrf_scores = {}
         score_metadata = {}
@@ -1610,6 +1756,7 @@ class TurbopufferClient:
             if item_id in fts_ranks:
                 fts_rrf_score = fts_weight / (k + fts_ranks[item_id])
 
+            # 同一条记录如果同时被向量和 FTS 命中，会累加两边贡献；只命中一边也能保留。
             combined_score = vector_rrf_score + fts_rrf_score
 
             rrf_scores[item_id] = combined_score
@@ -1626,9 +1773,11 @@ class TurbopufferClient:
 
         return sorted_results[:top_k]
 
-    # 单条 passage 删除走 archive namespace 和 passage_id，适合用户删除某条长期记忆时同步清理向量索引。
     @trace_method
     @async_retry_with_backoff()
+    # ————————————————————————————————————————
+    # 删除单条 archival passage：先解析 archive namespace，再按 passage_id 删除 TPUF 中对应向量记录。
+    # ————————————————————————————————————————
     async def delete_passage(self, archive_id: str, passage_id: str) -> bool:
         """Delete a passage from Turbopuffer."""
 
@@ -1636,6 +1785,7 @@ class TurbopufferClient:
 
         try:
             # Run in thread pool for consistency (deletes are lightweight but use same wrapper)
+            # 真正的 TPUF write 放到线程池执行，这是本文件的核心性能设计：避免向量序列化阻塞 asyncio event loop。
             await asyncio.to_thread(
                 _run_turbopuffer_write_in_thread,
                 api_key=self.api_key,
@@ -1649,9 +1799,11 @@ class TurbopufferClient:
             logger.error(f"Failed to delete passage from Turbopuffer: {e}")
             raise
 
-    # 批量 passage 删除复用同一个 write wrapper。空列表直接成功返回，避免上层为了“没有可删项”额外分支。
     @trace_method
     @async_retry_with_backoff()
+    # ————————————————————————————————————————
+    # 批量删除 archival passages：逻辑和 delete_passage 一样，但一次传入多个 IDs 减少 TPUF 写调用。
+    # ————————————————————————————————————————
     async def delete_passages(self, archive_id: str, passage_ids: List[str]) -> bool:
         """Delete multiple passages from Turbopuffer."""
 
@@ -1662,6 +1814,7 @@ class TurbopufferClient:
 
         try:
             # Run in thread pool for consistency
+            # 真正的 TPUF write 放到线程池执行，这是本文件的核心性能设计：避免向量序列化阻塞 asyncio event loop。
             await asyncio.to_thread(
                 _run_turbopuffer_write_in_thread,
                 api_key=self.api_key,
@@ -1675,9 +1828,12 @@ class TurbopufferClient:
             logger.error(f"Failed to delete passages from Turbopuffer: {e}")
             raise
 
-    # 整个 archive 清空时直接调用 namespace.delete_all，而不是按 ID 枚举删除，适合重建 archive 或删除 agent 记忆。
     @trace_method
     @async_retry_with_backoff()
+    # ————————————————————————————————————————
+    # 清空某个 archive 的全部 passage 向量。
+    # 这里使用 namespace.delete_all，而不是 delete_by_filter，因为 archive namespace 本身已经是 archive 级隔离。
+    # ————————————————————————————————————————
     async def delete_all_passages(self, archive_id: str) -> bool:
         """Delete all passages for an archive from Turbopuffer."""
         from turbopuffer import AsyncTurbopuffer
@@ -1695,9 +1851,12 @@ class TurbopufferClient:
             logger.error(f"Failed to delete all passages from Turbopuffer: {e}")
             raise
 
-    # 消息按 ID 删除，用于数据库消息被硬删或更新索引时同步移除 Turbopuffer 中的旧向量。
     @trace_method
     @async_retry_with_backoff()
+    # ————————————————————————————————————————
+    # 按 message_ids 删除消息向量记录。
+    # 虽然传入 agent_id 用于日志，但实际删除是在 organization-scoped namespace 里按 id 执行。
+    # ————————————————————————————————————————
     async def delete_messages(self, agent_id: str, organization_id: str, message_ids: List[str]) -> bool:
         """Delete multiple messages from Turbopuffer."""
 
@@ -1708,6 +1867,7 @@ class TurbopufferClient:
 
         try:
             # Run in thread pool for consistency
+            # 真正的 TPUF write 放到线程池执行，这是本文件的核心性能设计：避免向量序列化阻塞 asyncio event loop。
             await asyncio.to_thread(
                 _run_turbopuffer_write_in_thread,
                 api_key=self.api_key,
@@ -1721,9 +1881,12 @@ class TurbopufferClient:
             logger.error(f"Failed to delete messages from Turbopuffer: {e}")
             raise
 
-    # 删除某个 agent 的全部消息时，message namespace 仍是组织级，因此这里用 agent_id filter 精确删除，不影响同组织其他 agent。
     @trace_method
     @async_retry_with_backoff()
+    # ————————————————————————————————————————
+    # 删除某个 agent 的全部消息向量。
+    # 因为 messages namespace 是组织级别，所以不能 delete_all namespace，只能 delete_by_filter(agent_id)。
+    # ————————————————————————————————————————
     async def delete_all_messages(self, agent_id: str, organization_id: str) -> bool:
         """Delete all messages for an agent from Turbopuffer."""
 
@@ -1744,10 +1907,15 @@ class TurbopufferClient:
             logger.error(f"Failed to delete all messages from Turbopuffer: {e}")
             raise
 
+    # 下面进入 file/source passage 相关逻辑。它和 archival memory 很像，但 namespace 和过滤维度不同：
+    # archival memory 以 archive_id 隔离；file passages 以 organization namespace + source_id/file_id filter 隔离。
     # file/source passage methods
 
-    # file passages 和 archival passages 分开存：文件内容属于 source/file 检索域，namespace 按组织隔离，查询时再按 source_id/file_id 过滤。
     @trace_method
+    # ————————————————————————————————————————
+    # file passages 使用独立的 organization-scoped namespace，区别于 archival passages 和 messages。
+    # source_id/file_id 会作为列和 filter 使用，支持按数据源或具体文件检索/删除。
+    # ————————————————————————————————————————
     async def _get_file_passages_namespace_name(self, organization_id: str) -> str:
         """Get namespace name for file passages (org-scoped).
 
@@ -1757,6 +1925,7 @@ class TurbopufferClient:
         Returns:
             The org-scoped namespace name for file passages
         """
+        # namespace 命名都考虑 environment，是为了让同一个 organization 在不同部署环境中拥有隔离索引。
         environment = settings.environment
         if environment:
             namespace_name = f"file_passages_{organization_id}_{environment.lower()}"
@@ -1765,10 +1934,12 @@ class TurbopufferClient:
 
         return namespace_name
 
-    # 文件 passage 写入路径把文件切块、生成 embedding，并带上 source_id 与 file_id。这样同一组织里可以按数据源或单个文件范围搜索。
-    # 与 archival memory 不同，这里 passage_id 由 PydanticPassage 新建时生成，因为文件索引主要由 Turbopuffer 这侧承载。
     @trace_method
     @async_retry_with_backoff()
+    # ————————————————————————————————————————
+    # 文件 passage 写入路径：把文件切片文本嵌入后写入 file_passages namespace。
+    # 每条记录同时保存 source_id 和 file_id，之后可以按 source 或 file 精确过滤。
+    # ————————————————————————————————————————
     async def insert_file_passages(
         self,
         source_id: str,
@@ -1795,7 +1966,6 @@ class TurbopufferClient:
         if not text_chunks:
             return []
 
-        # 空 chunk 不参与 embedding 和写入，但保留 original_idx，后面才能从 passage_ids 中取回原始位置对应的 ID。
         # filter out empty text chunks
         filtered_chunks = [text for text in text_chunks if text.strip()]
 
@@ -1806,9 +1976,11 @@ class TurbopufferClient:
         # generate embeddings using the default config
         embeddings = await self._generate_embeddings(filtered_chunks, actor)
 
+        # file passage 的查询/写入/删除都进入独立 namespace，不会和 archival memory 或 messages 混在一起。
         namespace_name = await self._get_file_passages_namespace_name(organization_id)
 
         # handle timestamp - ensure UTC
+        # 写入时间统一归一到 UTC，后续时间过滤也会转 UTC，这样跨时区查询不会产生偏差。
         if created_at is None:
             timestamp = datetime.now(timezone.utc)
         else:
@@ -1831,6 +2003,7 @@ class TurbopufferClient:
         passages = []
 
         for text, embedding in zip(filtered_chunks, embeddings):
+            # 写入 TPUF 的同时构造 PydanticPassage 返回给调用方，让上层不用再从 TPUF 读一次就能拿到插入结果。
             passage = PydanticPassage(
                 text=text,
                 file_id=file_id,
@@ -1851,6 +2024,8 @@ class TurbopufferClient:
             created_ats.append(timestamp)
 
         # build column-based upsert data
+        # Turbopuffer 写入采用列式格式：每个字段是一列数组，同一索引位置代表同一条记录。
+        # 因此前面所有 ids/vectors/texts 等列表必须保持长度一致、顺序一致。
         upsert_columns = {
             "id": ids,
             "vector": vectors,
@@ -1863,8 +2038,10 @@ class TurbopufferClient:
 
         try:
             # Use global semaphore to limit concurrent Turbopuffer writes
+            # 写 TPUF 前先拿全局 semaphore，限制并发写入数量，避免批量 embedding 完成后同时冲击向量库。
             async with _GLOBAL_TURBOPUFFER_SEMAPHORE:
                 # Run in thread pool to prevent CPU-intensive base64 encoding from blocking event loop
+                # 真正的 TPUF write 放到线程池执行，这是本文件的核心性能设计：避免向量序列化阻塞 asyncio event loop。
                 await asyncio.to_thread(
                     _run_turbopuffer_write_in_thread,
                     api_key=self.api_key,
@@ -1884,9 +2061,12 @@ class TurbopufferClient:
                 logger.error("Duplicate passage IDs detected in batch")
             raise
 
-    # 文件 passage 查询入口始终先限制 source_ids，防止跨数据源串结果；如果指定 file_id，再进一步收窄到单个文件。
-    # 检索和排序流程沿用通用 _execute_query 与 RRF，因此文件搜索和记忆搜索在相关性逻辑上保持一致。
     @trace_method
+    # ————————————————————————————————————————
+    # 文件 passage 查询路径：必须至少按 source_ids 过滤，避免在组织内所有文件中无限制搜索。
+    # 如果传入 file_id，则在 source 过滤基础上进一步限定到单个文件。
+    # 检索模式和 archival passages 一致，hybrid 仍通过 RRF 合并向量与全文结果。
+    # ————————————————————————————————————————
     async def query_file_passages(
         self,
         source_ids: List[str],
@@ -1917,19 +2097,21 @@ class TurbopufferClient:
         """
         # generate embedding for vector/hybrid search if query_text is provided
         query_embedding = None
+        # 只有 vector/hybrid 需要 query embedding；纯 FTS 直接使用 query_text，不额外消耗 embedding 请求。
         if query_text and search_mode in ["vector", "hybrid"]:
             embeddings = await self._generate_embeddings([query_text], actor)
             query_embedding = embeddings[0]
 
         # check if we should fallback to timestamp-based retrieval
+        # 没有查询文本时自动切到 timestamp，保证调用方可以用同一个接口“搜索或取最近内容”。
         if query_embedding is None and query_text is None and search_mode not in ["timestamp"]:
             # fallback to retrieving most recent passages when no search query is provided
             search_mode = "timestamp"
 
         namespace_name = await self._get_file_passages_namespace_name(organization_id)
 
-        # 文件查询不允许无源范围地全组织搜索，source_ids 是最小安全边界。
         # build filters - always filter by source_ids
+        # source_ids 是文件检索的基本边界：单 source 用 Eq 更直接，多 source 用 In。
         if len(source_ids) == 1:
             # single source_id, use Eq for efficiency
             filters = [("source_id", "Eq", source_ids[0])]
@@ -1959,7 +2141,7 @@ class TurbopufferClient:
             )
 
             # process results based on search mode
-            # 查询结果处理分两路：hybrid 拿到 multi_query 的两个 result 集合；单一模式只处理一个 rows 列表。
+            # 混合检索结果需要特殊处理：result.results[0] 和 result.results[1] 分别对应前面构造的 vector 与 FTS 查询。
             if search_mode == "hybrid":
                 # for hybrid mode, we get a multi-query response
                 vector_results = self._process_file_query_results(result.results[0])
@@ -1992,11 +2174,15 @@ class TurbopufferClient:
             logger.error(f"Failed to query file passages from Turbopuffer: {e}")
             raise
 
-    # 文件 passage 的结果还原和 archive passage 类似，但对象里重点保留 source_id/file_id，方便上层知道命中内容来自哪个文件。
+    # ————————————————————————————————————————
+    # 把文件 passage 的 TPUF row 转成 PydanticPassage。
+    # 这里保留 source_id/file_id，方便上层知道命中的文本来自哪个数据源和文件。
+    # ————————————————————————————————————————
     def _process_file_query_results(self, result, is_fts: bool = False) -> List[Tuple[PydanticPassage, float]]:
         """Process results from a file query into passage objects with scores."""
         passages_with_scores = []
 
+        # 所有 _process_* 方法都在这里把 TPUF row 的动态属性转成 Letta 明确的数据结构。
         for row in result.rows:
             # build metadata
             metadata = {}
@@ -2029,9 +2215,11 @@ class TurbopufferClient:
 
         return passages_with_scores
 
-    # 删除单个文件的索引时同时过滤 source_id 和 file_id，避免不同 source 中同名或同 ID 语义冲突造成误删。
     @trace_method
     @async_retry_with_backoff()
+    # ————————————————————————————————————————
+    # 删除某个文件的所有 passage 向量，过滤条件必须同时包含 source_id 和 file_id，避免误删同名或跨 source 数据。
+    # ————————————————————————————————————————
     async def delete_file_passages(self, source_id: str, file_id: str, organization_id: str) -> bool:
         """Delete all passages for a specific file from Turbopuffer."""
 
@@ -2058,9 +2246,12 @@ class TurbopufferClient:
             logger.error(f"Failed to delete file passages from Turbopuffer: {e}")
             raise
 
-    # 删除整个 source 的索引时只按 source_id 过滤，常见于数据源解绑、重建或批量刷新文件索引。
     @trace_method
     @async_retry_with_backoff()
+    # ————————————————————————————————————————
+    # 删除某个 source 下所有文件 passage。
+    # 这是比 delete_file_passages 更粗粒度的清理，通常用于数据源被移除或重建索引。
+    # ————————————————————————————————————————
     async def delete_source_passages(self, source_id: str, organization_id: str) -> bool:
         """Delete all passages for a source from Turbopuffer."""
 
@@ -2083,9 +2274,12 @@ class TurbopufferClient:
 
     # tool methods
 
-    # tool 删除按 tool_id 批量执行，和 insert_tools 对应，用于工具被移除或重新索引前清理旧记录。
     @trace_method
     @async_retry_with_backoff()
+    # ————————————————————————————————————————
+    # 删除工具索引记录。
+    # tools namespace 是组织级别，传入 tool_ids 后直接按 ID 删除对应工具向量。
+    # ————————————————————————————————————————
     async def delete_tools(self, organization_id: str, tool_ids: List[str]) -> bool:
         """Delete tools from Turbopuffer.
 
@@ -2104,6 +2298,7 @@ class TurbopufferClient:
 
         try:
             # Run in thread pool for consistency
+            # 真正的 TPUF write 放到线程池执行，这是本文件的核心性能设计：避免向量序列化阻塞 asyncio event loop。
             await asyncio.to_thread(
                 _run_turbopuffer_write_in_thread,
                 api_key=self.api_key,
@@ -2117,9 +2312,11 @@ class TurbopufferClient:
             logger.error(f"Failed to delete tools from Turbopuffer: {e}")
             raise
 
-    # tool 查询用于从组织工具库中按语义找可用工具。它支持 tool_type 和 tags 过滤，让“找能力”与“限制工具范围”分开表达。
-    # 没有 query_text 时会退化为 timestamp 检索，意味着可以把同一个 API 用于“搜索工具”和“列出最近工具”。
     @trace_method
+    # ————————————————————————————————————————
+    # 工具检索路径：把查询文本 embedding 后，在 org-scoped tools namespace 中查找语义相近的工具。
+    # 它支持按 tool_type 和 tags 过滤，适合从工具库中按自然语言找可用工具。
+    # ————————————————————————————————————————
     async def query_tools(
         self,
         organization_id: str,
@@ -2160,8 +2357,8 @@ class TurbopufferClient:
 
         namespace_name = await self._get_tool_namespace_name(organization_id)
 
-        # 工具查询的过滤条件都是可选的：没有过滤器时搜索整个组织工具库，有 tool_types/tags 时只缩小候选集，不改变排序逻辑。
         # Build filters
+        # 组织级查询没有强制 agent_id，所以 filter 从空列表开始，再按调用方传入条件逐步收窄。
         all_filters = []
 
         if tool_types:
@@ -2174,6 +2371,7 @@ class TurbopufferClient:
             all_filters.append(("tags", "ContainsAny", tags))
 
         # Combine filters
+        # filter 最终要么为空、单个条件，要么是 ("And", [...])；这是 Turbopuffer filter 表达式的预期结构。
         final_filter = None
         if len(all_filters) == 1:
             final_filter = all_filters[0]
@@ -2193,7 +2391,7 @@ class TurbopufferClient:
                 fts_weight=fts_weight,
             )
 
-            # 查询结果处理分两路：hybrid 拿到 multi_query 的两个 result 集合；单一模式只处理一个 rows 列表。
+            # 混合检索结果需要特殊处理：result.results[0] 和 result.results[1] 分别对应前面构造的 vector 与 FTS 查询。
             if search_mode == "hybrid":
                 vector_results = self._process_tool_query_results(result.results[0])
                 fts_results = self._process_tool_query_results(result.results[1])
@@ -2222,10 +2420,14 @@ class TurbopufferClient:
             logger.error(f"Failed to query tools from Turbopuffer: {e}")
             raise
 
-    # tool 查询结果保持为 dict，而不是还原完整 Tool 模型；搜索层只需要展示/排序所需字段，完整工具加载可交给上层服务。
+    # ————————————————————————————————————————
+    # 把工具查询 row 转成普通 dict，保留工具的 id/name/text/type/tags/created_at。
+    # 上层可以用这些字段展示候选工具，也可以进一步回数据库取完整 Tool 对象。
+    # ————————————————————————————————————————
     def _process_tool_query_results(self, result) -> List[dict]:
         """Process results from a tool query into tool dicts."""
         tools = []
+        # 所有 _process_* 方法都在这里把 TPUF row 的动态属性转成 Letta 明确的数据结构。
         for row in result.rows:
             tool_dict = {
                 "id": row.id,
