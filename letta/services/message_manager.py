@@ -25,7 +25,14 @@ from letta.validators import raise_on_invalid_id
 
 logger = get_logger(__name__)
 
+# 这个模块集中管理消息表的读写、检索与向量索引同步。
+# 代码的主线可以理解为三层：先把 Message 在数据库中安全地创建/更新/删除，
+# 再把可搜索文本抽取出来同步到 Turbopuffer，最后为 conversation_search 等上层工具提供统一检索入口。
 
+
+# 历史兼容逻辑放在类外，便于所有读取入口复用。
+# 它只修复“单个 assistant tool call 紧跟单个 tool return”的确定性场景，
+# 对并行工具调用或缺少前序调用 ID 的情况保持保守，避免错误地把不同工具结果串起来。
 @trace_method
 def backfill_missing_tool_call_ids(messages: list, agent_id: Optional[str] = None, actor: Optional[PydanticUser] = None) -> list:
     """Backfill missing tool_call_id values in tool messages from historical bug (oct 1-6, 2025)
@@ -38,13 +45,17 @@ def backfill_missing_tool_call_ids(messages: list, agent_id: Optional[str] = Non
     Returns:
         List of messages with tool_call_ids backfilled where appropriate
     """
+    # 空列表直接返回，避免下面的顺序判断和遍历做无意义工作。
     if not messages:
+        # 没有历史消息时，没有任何 tool_call_id 可以推断，直接短路。
         return messages
 
     from letta.schemas.message import Message as PydanticMessage
 
     # Check if messages are ordered chronologically (oldest first)
     # If not, reverse the list to ensure proper chronological order
+    # 回填逻辑依赖“assistant 调用在前、tool 返回在后”的时间顺序；如果调用方传的是倒序列表，
+    # 这里会临时反转，处理完成后再恢复原顺序，避免改变外部 API 的返回约定。
     was_reversed = False
     if len(messages) > 1:
         first_msg = messages[0]
@@ -67,11 +78,13 @@ def backfill_missing_tool_call_ids(messages: list, agent_id: Optional[str] = Non
     backfilled_count = 0
 
     for i, message in enumerate(messages):
+        # 逐条维护一个 last_tool_call_id，相当于记住“最近一次可安全配对的 assistant 工具调用”。
         if not isinstance(message, PydanticMessage):
             updated_messages.append(message)
             continue
 
         # check if assistant message has a single tool call to track
+        # 只有单工具调用才可确定后续 tool message 的来源；并行调用不能凭位置猜测。
         if message.role == MessageRole.assistant and message.tool_calls:
             if len(message.tool_calls) == 1 and message.tool_calls[0].id:
                 last_tool_call_id = message.tool_calls[0].id
@@ -80,6 +93,7 @@ def backfill_missing_tool_call_ids(messages: list, agent_id: Optional[str] = Non
                 last_tool_call_id = None
 
         # check if tool message needs backfilling
+        # tool 消息只在“自身只有一个 return 且前面确实记录了单个调用 ID”时回填。
         elif message.role == MessageRole.tool:
             needs_update = False
 
@@ -119,13 +133,20 @@ def backfill_missing_tool_call_ids(messages: list, agent_id: Optional[str] = Non
     return updated_messages
 
 
+# MessageManager 是消息业务层的汇总入口：上层 agent loop 不直接拼 SQL，
+# 而是通过这里统一处理权限校验、顺序保持、嵌入同步、搜索回退和历史数据修复。
 class MessageManager:
     """Manager class to handle business logic related to Messages."""
 
+    # 初始化阶段只挂载 FileManager，真正的数据库会话在每个方法里按需打开，
+    # 这样可以让消息管理器保持轻量、无长连接状态。
     def __init__(self):
         """Initialize the MessageManager."""
         self.file_manager = FileManager()
 
+    # 搜索和 embedding 不能直接使用原始 Message.content，因为它可能是多模态结构、工具调用或内部心跳。
+    # 这个方法先过滤不应索引的角色/工具消息，再把可搜索内容统一压成 JSON 字符串，
+    # 让后续 SQL LIKE、Turbopuffer embedding 和 conversation_search 的输出格式保持一致。
     def _extract_message_text(self, message: PydanticMessage) -> str:
         """Extract text content from a message's complex content structure.
 
@@ -138,6 +159,9 @@ class MessageManager:
         Returns:
             JSON string with message content, or empty string for non-searchable roles
         """
+        # 第一层先做“是否值得进入搜索索引”的判断。
+        # system/approval 等角色、send_message 的 tool return、conversation_search 的 tool return 都会制造噪音或递归文本，
+        # 因此在真正提取正文前就被过滤掉。
         # only extract text from searchable roles
         if message.role not in [MessageRole.assistant, MessageRole.user, MessageRole.tool]:
             return ""
@@ -147,9 +171,12 @@ class MessageManager:
             return ""
 
         if not message.content:
+            # 没有 content 的消息没有可索引文本，直接跳过。
             return ""
 
         # extract raw content text
+        # content 可能已经是字符串，也可能是 TextContent/ReasoningContent/图片等结构化片段。
+        # 这里只抽取能转成文本的部分，多模态数据本身不直接进入消息搜索文本。
         if isinstance(message.content, str):
             content_str = message.content
         else:
@@ -174,6 +201,7 @@ class MessageManager:
             content_str = " ".join(text_parts)
 
         # skip heartbeat messages entirely
+        # heartbeat 是 agent loop 的内部续步信号，不代表用户或助手的真实语义内容。
         try:
             if content_str.strip().startswith("{"):
                 parsed_content = json.loads(content_str)
@@ -183,6 +211,7 @@ class MessageManager:
             pass
 
         # format everything as JSON
+        # 统一 JSON 形态可以避免上层再次包装时出现结构不一致；如果原文本已经是 JSON，则尽量原样保留。
         if message.role == MessageRole.user:
             # check if content_str is already valid JSON to avoid double nesting
             try:
@@ -194,6 +223,8 @@ class MessageManager:
                 return json.dumps({"content": content_str})
 
         elif message.role == MessageRole.assistant and message.tool_calls:
+            # assistant + tool_calls 的情况要区分“对用户发消息”和“调用内部检索工具”。
+            # send_message 的参数才是真正给用户看的内容；conversation_search 则会被过滤，避免搜索结果搜索自己。
             # skip assistant messages that call conversation_search
             for tool_call in message.tool_calls:
                 if tool_call.function.name == CONVERSATION_SEARCH_TOOL_NAME:
@@ -226,6 +257,8 @@ class MessageManager:
             # for tool messages and others, wrap in content
             return json.dumps({"content": content_str})
 
+    # embedding 前会尽量把 assistant 的工具调用和紧随其后的 tool 结果合并成一条语义完整的记录。
+    # 这样搜索“某次工具查到了什么”时，向量库能同时看到调用意图、参数和返回摘要，而不是两条割裂消息。
     def _combine_assistant_tool_messages(self, messages: List[PydanticMessage]) -> List[PydanticMessage]:
         """Combine assistant messages with their corresponding tool results when IDs match.
 
@@ -235,15 +268,19 @@ class MessageManager:
         Returns:
             List of messages with assistant+tool combinations merged
         """
+        # 顺序扫描而不是哈希全局匹配，是因为工具结果通常紧跟对应 assistant 消息；
+        # 这样既保留对话时序，也能避免跨很远距离误合并同名工具调用。
         from letta.constants import DEFAULT_MESSAGE_TOOL
 
         combined_messages = []
         i = 0
 
         while i < len(messages):
+            # i 只向前移动：普通消息走一步，成功合并 assistant+tool 时一次跳过两条。
             current_msg = messages[i]
 
             # skip heartbeat messages
+            # 复用抽取函数作为过滤器：抽不出搜索文本的消息也不需要进入合并结果。
             if self._extract_message_text(current_msg) == "":
                 i += 1
                 continue
@@ -253,6 +290,7 @@ class MessageManager:
                 next_msg = messages[i + 1]
 
                 # check if next message is a tool response that matches
+                # 只合并紧邻且 tool_call_id 对得上的工具返回，确保“调用—结果”关系明确。
                 if (
                     next_msg.role == MessageRole.tool
                     and next_msg.tool_call_id
@@ -293,6 +331,7 @@ class MessageManager:
                         matching_tool_call = next((tc for tc in current_msg.tool_calls if tc.id == next_msg.tool_call_id), None)
 
                         # format tool call with parameters
+                        # 将函数名和参数格式化为一段可读文本，提升向量搜索时的召回质量。
                         try:
                             args = json.loads(matching_tool_call.function.arguments)
                             if args:
@@ -305,6 +344,7 @@ class MessageManager:
                             tool_call_str = f"{matching_tool_call.function.name}()"
 
                         # format tool result cleanly
+                        # 工具返回经常是 JSON；优先抽取 message/status 等摘要字段，避免把完整机器格式塞进 embedding。
                         try:
                             if tool_result_text.strip().startswith("{"):
                                 parsed_result = json.loads(tool_result_text)
@@ -345,6 +385,7 @@ class MessageManager:
 
         return combined_messages
 
+    # 单条读取入口：只负责按 ID 和 actor 权限取消息，不做额外排序或后处理。
     @enforce_types
     @raise_on_invalid_id(param_name="message_id", expected_prefix=PrimitiveType.MESSAGE)
     @trace_method
@@ -362,6 +403,7 @@ class MessageManager:
             except NoResultFound:
                 return None
 
+    # 批量读取入口：数据库返回顺序不一定等于请求顺序，所以后面会专门按 message_ids 重排。
     @enforce_types
     @trace_method
     async def get_messages_by_ids_async(self, message_ids: List[str], actor: PydanticUser) -> List[PydanticMessage]:
@@ -375,6 +417,8 @@ class MessageManager:
             )
             return self._get_messages_by_id_postprocess(results, message_ids)
 
+    # 批量读取后的统一后处理：先按调用方给出的 ID 顺序恢复列表，再补历史 tool_call_id。
+    # 这保证 agent 的上下文窗口按原始消息链路组装，而不是按数据库返回顺序随机漂移。
     def _get_messages_by_id_postprocess(
         self,
         results: List[MessageModel],
@@ -395,6 +439,7 @@ class MessageManager:
         # TODO: We should remove this as soon as possible, need to inspect for the above log message, if it hasn't happened in a while
         return backfill_missing_tool_call_ids(messages)
 
+    # Pydantic schema 适合业务层传递，ORM model 才能入库；这里完成批量转换并补齐 organization_id。
     def _create_many_preprocess(self, pydantic_msgs: List[PydanticMessage], actor: PydanticUser) -> List[MessageModel]:
         # Create ORM model instances for all messages
         orm_messages = []
@@ -405,6 +450,7 @@ class MessageManager:
             orm_messages.append(MessageModel(**msg_data))
         return orm_messages
 
+    # 消息可关联 run，但 run 可能被并发删除；这个小工具用于提前确认外键目标仍存在。
     @enforce_types
     @trace_method
     async def check_run_exists_async(self, run_id: str, actor: PydanticUser) -> bool:
@@ -427,6 +473,7 @@ class MessageManager:
             result = await session.execute(query)
             return result.scalar_one_or_none() is not None
 
+    # allow_partial 模式需要知道哪些消息已经入库，以便跳过重复项而不是让整批写入失败。
     @enforce_types
     @trace_method
     async def check_existing_message_ids(self, message_ids: List[str], actor: PydanticUser) -> Set[str]:
@@ -447,6 +494,7 @@ class MessageManager:
             result = await session.execute(query)
             return set(result.scalars().all())
 
+    # 把待写入消息拆成“新消息”和“已存在消息”，为幂等写入提供基础。
     @enforce_types
     @trace_method
     async def filter_existing_messages(
@@ -472,6 +520,8 @@ class MessageManager:
 
         return new_messages, existing_messages
 
+    # 批量创建是整个类最核心的写路径：它先做幂等/多模态预处理和 run_id 防护，
+    # 再一次性写数据库，最后按配置异步或同步把可搜索消息送去 Turbopuffer。
     @enforce_types
     @trace_method
     async def create_many_messages_async(
@@ -498,14 +548,18 @@ class MessageManager:
         Returns:
             List of created Pydantic message models (and existing ones if allow_partial=True)
         """
+        # 没有消息时保持幂等：上层可以安全调用，不需要先自己判断空列表。
         if not pydantic_msgs:
             return []
 
         messages_to_create = pydantic_msgs
         existing_messages = []
 
+        # 默认是严格批量写入；只有 allow_partial=True 时才把重复消息拆出去，支持幂等重放。
+
         if allow_partial:
             # filter out messages that already exist
+            # 这类场景常见于重试或事件回放：新消息继续写，旧消息最后补回返回列表。
             new_messages, existing_messages = await self.filter_existing_messages(pydantic_msgs, actor)
             messages_to_create = new_messages
 
@@ -520,6 +574,8 @@ class MessageManager:
                     return [msg.to_pydantic() for msg in result.scalars()]
 
         for message in messages_to_create:
+            # 入库前先处理 base64 图片：当前实现用占位 file_id 保留引用形态，
+            # 避免 ORM 直接存储完整图片对象时破坏消息 schema。
             if isinstance(message.content, list):
                 for content in message.content:
                     if content.type == MessageContentType.image and content.source.type == ImageSourceType.base64:
@@ -547,6 +603,7 @@ class MessageManager:
 
         # Validate run_ids exist before inserting to prevent ForeignKeyViolationError
         # This handles the case where a run is deleted while messages are being created
+        # run 与 message 之间存在外键关系；如果 run 在并发中被删除，宁可清空 run_id，也不要让整批消息写入失败。
         unique_run_ids = {msg.run_id for msg in messages_to_create if msg.run_id}
         if unique_run_ids:
             from letta.orm.run import Run as RunModel
@@ -569,6 +626,7 @@ class MessageManager:
                         msg.run_id = None
 
         orm_messages = self._create_many_preprocess(messages_to_create, actor)
+        # 真正的数据库写入集中在这里完成，no_commit/no_refresh 交给 session context 统一处理提交生命周期。
         async with db_registry.async_session() as session:
             created_messages = await MessageModel.batch_create_async(orm_messages, session, actor=actor, no_commit=True, no_refresh=True)
             result = [msg.to_pydantic() for msg in created_messages]
@@ -578,10 +636,12 @@ class MessageManager:
         from letta.helpers.tpuf_client import should_use_tpuf_for_messages
 
         if should_use_tpuf_for_messages() and result:
+            # 数据库写入成功后再启动 embedding，同步对象以实际创建后的消息为准。
             agent_id = result[0].agent_id
             if agent_id:
                 # Filter out system messages before embedding to avoid unnecessary processing
                 # System messages (especially initial agent system messages) can be very large
+                # system prompt 对检索用户历史通常帮助不大，且可能极长，所以主动排除。
                 messages_to_embed = [msg for msg in result if msg.role != MessageRole.system]
                 if messages_to_embed:
                     if strict_mode:
@@ -602,6 +662,8 @@ class MessageManager:
 
         return result
 
+    # 写库完成后，embedding 是派生索引，不应该阻塞主流程太久。
+    # 这里在后台抽取文本、合并工具上下文，并把结果写入 Turbopuffer 供语义/混合搜索使用。
     async def _embed_messages_background(
         self,
         messages: List[PydanticMessage],
@@ -619,10 +681,13 @@ class MessageManager:
             project_id: Optional project ID for the messages
             template_id: Optional template ID for the messages
         """
+        # 这里故意吞掉异常：数据库消息已经写入成功，向量索引失败只影响搜索质量，
+        # 不应该反向破坏 agent 主流程。
         try:
             from letta.helpers.tpuf_client import TurbopufferClient
 
             # extract text content from each message
+            # 这些并行数组会按相同顺序传给 Turbopuffer，因此每个索引位置都代表同一条消息的文本和元数据。
             message_texts = []
             message_ids = []
             roles = []
@@ -630,6 +695,7 @@ class MessageManager:
             conversation_ids = []
 
             # combine assistant+tool messages before embedding
+            # 合并发生在 embedding 前，而不是检索后；这样向量本身就包含更完整的上下文。
             combined_messages = self._combine_assistant_tool_messages(messages)
 
             for msg in combined_messages:
@@ -643,6 +709,7 @@ class MessageManager:
 
             if message_texts:
                 # insert to turbopuffer - TurbopufferClient will generate embeddings internally
+                # 这里只传文本和元数据，embedding 的生成细节封装在 TurbopufferClient 中。
                 tpuf_client = TurbopufferClient()
                 await tpuf_client.insert_messages(
                     agent_id=agent_id,
@@ -661,6 +728,8 @@ class MessageManager:
             logger.error(f"Failed to embed messages in Turbopuffer for agent {agent_id}: {e}")
             # don't re-raise the exception in background mode - just log it
 
+    # 用户面对的是 LettaMessage，数据库里存的是底层 Message。
+    # 这个方法把用户可见消息更新转换成底层字段更新，例如 assistant_message 实际改的是 send_message 工具参数。
     @enforce_types
     @trace_method
     async def update_message_by_letta_message_async(
@@ -672,6 +741,8 @@ class MessageManager:
         message = await self.get_message_by_id_async(message_id=message_id, actor=actor)
         if letta_message_update.message_type == "assistant_message":
             # modify the tool call for send_message
+            # 对标准助手消息而言，用户看到的文本其实存放在 send_message 工具参数里，
+            # 所以更新 assistant_message 不是改 content，而是改 tool_calls[0].function.arguments。
             # TODO: fix this if we add parallel tool calls
             # TODO: note this only works if the AssistantMessage is generated by the standard send_message
             assert message.tool_calls[0].function.name == "send_message", (
@@ -684,6 +755,7 @@ class MessageManager:
 
             update_message = MessageUpdate(tool_calls=[update_tool_call])
         elif letta_message_update.message_type == "reasoning_message":
+            # reasoning_message 直接映射到底层 content。
             update_message = MessageUpdate(content=letta_message_update.reasoning)
         elif letta_message_update.message_type == "user_message" or letta_message_update.message_type == "system_message":
             update_message = MessageUpdate(content=letta_message_update.content)
@@ -693,6 +765,7 @@ class MessageManager:
         message = await self.update_message_by_id_async(message_id=message_id, message_update=update_message, actor=actor)
 
         # convert back to LettaMessage
+        # 写库后重新转换，是为了返回与最终数据库状态一致的用户可见消息，而不是返回请求体里的假定结果。
         for letta_msg in message.to_letta_messages(use_assistant_message=True):
             if letta_msg.message_type == letta_message_update.message_type:
                 return letta_msg
@@ -700,6 +773,8 @@ class MessageManager:
         # raise error if message type got modified
         raise ValueError(f"Message type got modified: {letta_message_update.message_type}")
 
+    # 标准更新路径：先从数据库读出原消息，复用实现函数做字段校验和赋值，
+    # 成功写回后再同步刷新向量索引中的文本表示。
     @enforce_types
     @trace_method
     async def update_message_by_id_async(
@@ -732,6 +807,7 @@ class MessageManager:
             )
 
             message = self._update_message_by_id_impl(message_id, message_update, actor, message)
+            # ORM 对象已被就地修改；这里负责把变更刷回数据库。
             await message.update_async(db_session=session, actor=actor, no_commit=True, no_refresh=True)
             pydantic_message = message.to_pydantic()
             # context manager now handles commits
@@ -740,6 +816,7 @@ class MessageManager:
         from letta.helpers.tpuf_client import should_use_tpuf_for_messages
 
         if should_use_tpuf_for_messages() and pydantic_message.agent_id:
+            # 更新向量索引前重新抽取文本，因为可搜索内容可能来自 content，也可能来自 send_message 参数。
             text = self._extract_message_text(pydantic_message)
 
             if text:
@@ -753,6 +830,7 @@ class MessageManager:
 
         return pydantic_message
 
+    # 更新消息后不能只改数据库；旧 embedding 也要删掉并用新文本重建，否则搜索会命中过期内容。
     async def _update_message_embedding_background(
         self, message: PydanticMessage, text: str, actor: PydanticUser, project_id: Optional[str] = None, template_id: Optional[str] = None
     ) -> None:
@@ -771,6 +849,7 @@ class MessageManager:
             tpuf_client = TurbopufferClient()
 
             # delete old message from turbopuffer
+            # 采用“先删后插”的方式，避免向量库里同一个 message_id 残留旧文本。
             await tpuf_client.delete_messages(agent_id=message.agent_id, organization_id=actor.organization_id, message_ids=[message.id])
 
             # re-insert with updated content - TurbopufferClient will generate embeddings internally
@@ -791,6 +870,8 @@ class MessageManager:
             logger.error(f"Failed to update message {message.id} in Turbopuffer: {e}")
             # don't re-raise the exception in background mode - just log it
 
+    # 真正修改 ORM 对象前先做角色级安全校验：assistant 才能有 tool_calls，tool 才能有 tool_call_id。
+    # 然后只写入发生变化的字段，减少无意义更新。
     def _update_message_by_id_impl(
         self, message_id: str, message_update: MessageUpdate, actor: PydanticUser, message: MessageModel
     ) -> MessageModel:
@@ -808,20 +889,24 @@ class MessageManager:
             )
 
         # get update dictionary
+        # exclude_unset/exclude_none 可以区分“没有传这个字段”和“显式要把字段设为空”的语义边界。
         update_data = message_update.model_dump(to_orm=True, exclude_unset=True, exclude_none=True)
         # Remove redundant update fields
+        # 只保留实际变化的字段，减少数据库更新和审计噪音。
         update_data = {key: value for key, value in update_data.items() if getattr(message, key) != value}
 
         for key, value in update_data.items():
             setattr(message, key, value)
         return message
 
+    # 删除单条消息时先记住 agent_id，因为数据库记录删掉后还要用它清理 Turbopuffer 中的对应向量。
     @enforce_types
     @raise_on_invalid_id(param_name="message_id", expected_prefix=PrimitiveType.MESSAGE)
     @trace_method
     async def delete_message_by_id_async(self, message_id: str, actor: PydanticUser, strict_mode: bool = False) -> bool:
         """Delete a message (async version with turbopuffer support)."""
         # capture agent_id before deletion
+        # 删除 ORM 记录后就无法再从消息对象拿 agent_id，所以必须提前保存给后续向量库清理使用。
         agent_id = None
         async with db_registry.async_session() as session:
             try:
@@ -849,6 +934,7 @@ class MessageManager:
 
         return True
 
+    # 轻量计数接口，供上层判断上下文规模或展示统计，不加载完整消息内容。
     @enforce_types
     @trace_method
     async def size_async(
@@ -865,6 +951,7 @@ class MessageManager:
         async with db_registry.async_session() as session:
             return await MessageModel.size_async(db_session=session, actor=actor, role=role, agent_id=agent_id)
 
+    # 常用便捷入口：把通用 list_messages 固定成只查 user 角色，避免调用方重复传过滤条件。
     @enforce_types
     @trace_method
     async def list_user_messages_for_agent_async(
@@ -890,6 +977,8 @@ class MessageManager:
             run_id=run_id,
         )
 
+    # 通用分页列表入口：围绕 Message 表直接构造查询，按 agent/group/run/conversation/role/text/cursor 逐层收窄。
+    # 它是上下文加载和历史浏览的基础，所以最后仍会做历史 tool_call_id 回填。
     @enforce_types
     @trace_method
     async def list_messages(
@@ -935,11 +1024,14 @@ class MessageManager:
         Raises:
             NoResultFound: If the provided after/before message IDs do not exist.
         """
+        # 所有查询都放在一个 session 中完成，权限校验、过滤、排序和分页共享同一事务视图。
 
         async with db_registry.async_session() as session:
             # Permission check: raise if the agent doesn't exist or actor is not allowed.
+            # 后续所有 where 条件都建立在权限通过的前提上，避免越权按 message_id/agent_id 猜数据。
 
             # Build a query that directly filters the Message table by agent_id.
+            # 查询从未删除消息开始，再逐步追加可选过滤条件，便于组合出不同列表场景。
             query = select(MessageModel)
             query = query.where(MessageModel.is_deleted == False)
 
@@ -955,11 +1047,13 @@ class MessageManager:
                 query = query.where(MessageModel.run_id == run_id)
 
             # Handle conversation_id filter
+            # conversation 过滤是 V3 会话隔离的关键：默认消息和指定 conversation 的消息不能混在同一上下文里。
             # Three cases:
             # 1. conversation_id=None (omitted) -> return all messages (no filter)
             # 2. conversation_id="default" -> return only default messages (not in any conversation)
             # 3. conversation_id="xyz" -> return only messages in that conversation
             if conversation_id == "default":
+                # default 表示“没有 conversation_id 且不在 conversation_messages 关系表里”的普通 agent 消息。
                 query = query.where(MessageModel.conversation_id.is_(None))
 
                 # Exclude messages that are in conversation_messages table
@@ -975,6 +1069,7 @@ class MessageManager:
             #    query = query.where((MessageModel.is_err == False) | (MessageModel.is_err.is_(None)))
 
             # If query_text is provided, filter messages using database-specific JSON search.
+            # content 是 JSON 数组，不同数据库对 JSON 搜索能力不同，因此 PostgreSQL 和 SQLite 分开处理。
             if query_text:
                 if settings.database_engine is DatabaseChoice.POSTGRES:
                     # PostgreSQL: Use json_array_elements and ILIKE
@@ -998,6 +1093,7 @@ class MessageManager:
                 query = query.where(MessageModel.role.in_(role_values))
 
             # Apply 'after' pagination if specified.
+            # 游标分页使用 sequence_id，而不是 created_at，避免同一时间戳或时钟漂移导致排序不稳定。
             if after:
                 after_query = select(MessageModel.sequence_id).where(
                     MessageModel.id == after,
@@ -1024,6 +1120,7 @@ class MessageManager:
                 query = query.where(MessageModel.sequence_id < before_ref.sequence_id)
 
             # Apply ordering based on the ascending flag.
+            # ascending=True 常用于重建上下文窗口；False 常用于最近历史列表。
             if ascending:
                 query = query.order_by(MessageModel.sequence_id.asc())
             else:
@@ -1040,6 +1137,7 @@ class MessageManager:
             # backfill missing tool_call_ids from historical bug (oct 1-6, 2025)
             return backfill_missing_tool_call_ids(messages, agent_id=agent_id, actor=actor)
 
+    # 清空 agent 消息时走批量 DELETE，避免逐条 ORM 加载；数据库删除完成后再清理向量索引。
     @enforce_types
     @trace_method
     async def delete_all_messages_for_agent_async(
@@ -1072,6 +1170,7 @@ class MessageManager:
             # await session.commit()
 
         # 5) delete from turbopuffer if enabled (outside of DB session)
+        # 向量库清理放在数据库 session 外，避免外部索引故障拖住数据库事务。
         from letta.helpers.tpuf_client import TurbopufferClient, should_use_tpuf_for_messages
 
         if should_use_tpuf_for_messages():
@@ -1089,6 +1188,7 @@ class MessageManager:
         # 6) return the number of rows deleted
         return rowcount
 
+    # 按 ID 批量删除时，需要先查出涉及的 agent_id，方便删除后按 agent 清理 Turbopuffer。
     @enforce_types
     @trace_method
     async def delete_messages_by_ids_async(self, message_ids: List[str], actor: PydanticUser, strict_mode: bool = False) -> int:
@@ -1105,6 +1205,7 @@ class MessageManager:
         from letta.helpers.tpuf_client import TurbopufferClient, should_use_tpuf_for_messages
 
         async with db_registry.async_session() as session:
+            # 删除前先收集涉及的 agent_id，因为 Turbopuffer 的消息删除以 agent 为命名空间。
             if should_use_tpuf_for_messages():
                 agent_query = (
                     select(MessageModel.agent_id)
@@ -1137,6 +1238,8 @@ class MessageManager:
 
         return rowcount
 
+    # agent 内搜索的统一入口：优先使用 Turbopuffer 做向量/全文/混合检索；
+    # 如果向量检索不可用或失败，则回退到 SQL 搜索，保证 conversation_search 至少有可用结果。
     @enforce_types
     @trace_method
     async def search_messages_async(
@@ -1170,9 +1273,12 @@ class MessageManager:
         Returns:
             List of tuples (message, metadata) where metadata contains relevance scores
         """
+        # 查询时的策略是“能用向量库就用，不能用就降级到 SQL”。
+        # 因为语义搜索是增强能力，不应成为消息检索的单点故障。
         from letta.helpers.tpuf_client import TurbopufferClient, should_use_tpuf_for_messages
 
         # check if we should use turbopuffer
+        # 有向量索引时优先走 Turbopuffer，能同时支持 vector/fts/hybrid/timestamp 等检索模式。
         if should_use_tpuf_for_messages():
             try:
                 # use turbopuffer for search - TurbopufferClient will generate embeddings internally
@@ -1192,6 +1298,8 @@ class MessageManager:
                 )
 
                 # create message-like objects using turbopuffer data (which already has properly extracted text)
+                # agent 内搜索不再二次查数据库，而是用索引里的轻量数据构造 Message，速度更快；
+                # 对需要完整数据库对象的组织级搜索，则在另一个方法里做回表。
                 if results:
                     # create simplified message objects from turbopuffer data
                     from letta.schemas.letta_message_content import TextContent
@@ -1218,6 +1326,7 @@ class MessageManager:
                     return []
 
             except Exception as e:
+                # 搜索降级策略：Turbopuffer 失败时记录错误，但仍返回 SQL 搜索结果，保证核心功能可用。
                 logger.error(f"Failed to search messages with Turbopuffer, falling back to SQL: {e}")
                 # fall back to SQL search
                 messages = await self.list_messages(
@@ -1240,6 +1349,7 @@ class MessageManager:
                 return message_tuples
         else:
             # use sql-based search
+            # 未启用向量索引时，使用 Message 表中的 JSON 文本匹配作为基础能力。
             messages = await self.list_messages(
                 agent_id=agent_id,
                 actor=actor,
@@ -1259,6 +1369,8 @@ class MessageManager:
                 message_tuples.append((message, metadata))
             return message_tuples
 
+    # 组织级搜索只支持 Turbopuffer，因为它要跨 agent/project/template/conversation 做统一召回。
+    # 返回时会把向量库命中的 message_id 再映射回数据库中的完整 Message，避免只返回索引快照。
     async def search_messages_org_async(
         self,
         actor: PydanticUser,
@@ -1295,10 +1407,12 @@ class MessageManager:
         Raises:
             ValueError: If message embedding or Turbopuffer is not enabled
         """
+        # 组织级搜索没有 SQL 回退路径，因为普通 Message 表查询很难高效完成跨范围语义召回。
         from letta.helpers.tpuf_client import TurbopufferClient, should_use_tpuf_for_messages
 
         # check if turbopuffer is enabled
         # TODO: extend to non-Turbopuffer in the future.
+        # 组织级检索需要跨命名空间召回和排序，当前只由 Turbopuffer 提供。
         if not should_use_tpuf_for_messages():
             raise ValueError("Message search requires message embedding, OpenAI, and Turbopuffer to be enabled.")
 
@@ -1324,6 +1438,7 @@ class MessageManager:
             return []
 
         # create message mapping
+        # Turbopuffer 负责召回和排序，数据库负责提供最终权威 Message 对象。
         message_ids = []
         embedded_text = {}
         for msg_dict, _, _ in results:
@@ -1333,6 +1448,7 @@ class MessageManager:
         message_mapping = {message.id: message for message in messages}
 
         # create search results using list comprehension
+        # 只返回仍能在数据库中找到的消息，避免向量索引与数据库短暂不一致时暴露孤儿结果。
         return [
             MessageSearchResult(
                 embedded_text=embedded_text[msg_id],
